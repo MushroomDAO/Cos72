@@ -1,0 +1,15 @@
+# pilot 仓库配置 — Cos72（MushroomDAO/Cos72）
+#
+# 单主干仓库：PR 直接开向 main，没有 preview 集成分支（integration_branch == base_branch），
+# 与 Sin90（iDoris-ai/Sin90）同构。评审：外部 clestons（PR-Daemon，常驻 Mac mini），
+# 规则见 Agent24 docs/agent/PLAN-ME4-OS-CAPABILITIES.md §一 第 6 条。
+#
+# ⚠️ 2026-09-29 立项时 main 尚未开 ruleset。在 jason 手动开 ruleset（1 个审批 + dismiss stale）之前，
+# git-guard 的 `merge-pr --allow-trunk` 会 fail-closed 拒绝 —— 这是对的。届时合并用
+# `gh pr merge <n> --squash`，前提仍是 clestons 的 APPROVED review 的 commit_id == 当前 headRefOid 且 check 全绿。
+base_branch: main
+integration_branch: main
+protect_patterns: [release, hotfix]
+remote: origin
+docs_dir: docs/agent
+planning_source: docs
