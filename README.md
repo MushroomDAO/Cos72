@@ -4,6 +4,47 @@
 
 Inspired by AAStar Cos72, we create a new one for communities~!
 
+## Development
+
+`cargo test` runs the unit/integration suite (schema, manifest, kernel
+wiring, structure boundaries). It never touches a real Agent24 daemon.
+
+### Real-mount black box (`tests/agent24_mount_blackbox.rs`)
+
+`#[ignore]`d so it never runs under plain `cargo test` / CI — it needs
+sibling checkouts of Agent24 (and, from T1.4.1 onward, Sin90) with their own
+binaries built from source. Run it explicitly:
+
+```sh
+# Cos72 alone (T1.1.1–T1.3.1 cases): needs a sibling Agent24 checkout.
+AGENT24_CHECKOUT=$HOME/Dev/auraai/Agent24 \
+  cargo test --features test-hooks --test agent24_mount_blackbox -- --ignored --test-threads=1
+
+# Cos72 + Sin90 co-mounted on the SAME real agent24d (T1.4.1's own two
+# cases, `cos72_full_flow_real_mount` / `cos72_and_sin90_coexist_isolated`):
+# additionally needs a sibling Sin90 checkout already migrated to
+# agent24-os-sdk (ME4-5.2.1). Missing SIN90_CHECKOUT is a hard panic, not a
+# skip, for these two cases — there is no default guess.
+AGENT24_CHECKOUT=$HOME/Dev/auraai/Agent24 \
+  SIN90_CHECKOUT=$HOME/Dev/auraai/sin90-design \
+  cargo test --features test-hooks --test agent24_mount_blackbox -- --ignored --test-threads=1
+```
+
+`--features test-hooks` is required for the whole invocation — several
+cases (from T1.3.1b onward) poll Cos72's own `test-hooks`-only `POST
+/debug/memory-recall` route, and the two T1.4.1 cases additionally drive
+Sin90's own `test-hooks`-only `POST /debug/kernel-roundtrip` route (built
+into a SEPARATE `sin90` binary under `$SIN90_CHECKOUT/target/test-hooks-debug`,
+so it never collides with a plain `cargo build` of Sin90). `--test-threads=1`
+because every case starts its own real `agent24d` subprocess bound to a
+throwaway `$HOME` under `/tmp` — they do not share state, but running them
+concurrently wastes CPU racing several real daemons for no benefit.
+
+`cargo test --features test-hooks --test agent24_mount_blackbox -- --ignored --list`
+lists every case without running any of them (useful to confirm the file
+still compiles, or to check the count docs/agent/tasks.md's own acceptance
+commands expect, without paying for a real mount).
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](https://opensource.org/licenses/Apache-2.0). See [LICENSE](./LICENSE) for details.
