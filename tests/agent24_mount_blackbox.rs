@@ -10,7 +10,28 @@
 //! only this repo); run explicitly:
 //!
 //!   AGENT24_CHECKOUT=$HOME/Dev/auraai/Agent24 \
-//!     cargo test --test agent24_mount_blackbox -- --ignored --test-threads=1
+//!     cargo test --features test-hooks --test agent24_mount_blackbox -- --ignored --test-threads=1
+//!
+//! `--features test-hooks` is required from `cos72_award_roundtrip_under_real_daemon`
+//! onward (T1.3.1b) — every test in this file that calls the `test-hooks`-only
+//! `POST /debug/memory-recall` route (`src/http/debug.rs`) needs the real
+//! `cos72` binary under test (`CARGO_BIN_EXE_cos72`, built once for the whole
+//! `cargo test` invocation, shared by every test in this file) built with
+//! that feature on. Omitting it does not fail fast — it 404s the debug route,
+//! which then reads as a `wait_for_memory_recall` timeout with a confusing
+//! daemon log.
+//!
+//! T1.4.1 additionally needs a sibling Sin90 checkout ALREADY MIGRATED to
+//! `agent24-os-sdk` (`SIN90_CHECKOUT` env var — no default guess, unlike
+//! `AGENT24_CHECKOUT`: docs/agent/tasks.md T1.4.1 验收命令 #3 requires this
+//! to be a hard panic, not a silent skip, when the checkout is missing) with
+//! a `Cargo.toml` at its root and its own `test-hooks` feature (for its
+//! `POST /debug/kernel-roundtrip` route, `src/adapter_agent24/kernel_roundtrip.rs`
+//! in that repo). Full run, both checkouts:
+//!
+//!   AGENT24_CHECKOUT=$HOME/Dev/auraai/Agent24 \
+//!     SIN90_CHECKOUT=$HOME/Dev/auraai/sin90-design \
+//!     cargo test --features test-hooks --test agent24_mount_blackbox -- --ignored --test-threads=1
 //!
 //! Harness shape (install/start/WS-subscribe/http helpers) mirrors Sin90's
 //! own `tests/agent24_mount_blackbox.rs` (docs/agent/acceptance.md「待补能力
@@ -18,7 +39,12 @@
 //! tests/agent24_mount_blackbox.rs") — a much smaller slice of it, scoped to
 //! T1.1.1's one acceptance case (mount + health + module.ready + the 401
 //! negative control); T1.2.1/T1.3.1/T1.4.1 grow this file with their own
-//! cases the same way Sin90's grew across its own M0–M5.
+//! cases the same way Sin90's grew across its own M0–M5. T1.4.1's own two
+//! cases (`cos72_full_flow_real_mount`, `cos72_and_sin90_coexist_isolated`)
+//! additionally build and install a REAL `sin90` binary from `SIN90_CHECKOUT`
+//! next to Cos72's — mirroring, at a source level (this crate cannot depend
+//! on a sibling repo's crate), Sin90's own `build_sin90_with_test_hooks` /
+//! `install_sin90`.
 #![cfg(unix)]
 
 use std::io::{BufReader, Read, Write};
@@ -898,4 +924,703 @@ fn cos72_task_routes_through_real_proxy() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// T1.4.1 (ME4-5.3.4, docs/agent/tasks.md) — real coexistence with Sin90.
+// Everything below this point is shared only by the two tests at the very
+// end of this file; every test above predates T1.4.1 and mounts Cos72 alone.
+// ---------------------------------------------------------------------------
+
+/// Locate a sibling Sin90 checkout already migrated to `agent24-os-sdk`
+/// (ME4-5.2.1). Deliberately NO default guess (unlike [`agent24_checkout`]):
+/// docs/agent/tasks.md T1.4.1 验收命令 #3 — "前置缺失即失败：不设
+/// `SIN90_CHECKOUT` 时该测试 panic（不是 pass/skip）" — a default path would
+/// let a test silently pass (or silently skip) against nothing, and a stale
+/// `PathBuf::exists()`-guarded default could also silently start mounting an
+/// UNRELATED directory that happens to contain a `Cargo.toml`. `unwrap` (not
+/// `unwrap_or_else`) on the env var read: any read failure (unset OR not
+/// valid Unicode) must be the same hard panic.
+fn sin90_checkout() -> PathBuf {
+    let dir = PathBuf::from(std::env::var("SIN90_CHECKOUT").unwrap_or_else(|_| {
+        panic!(
+            "SIN90_CHECKOUT env var must be set to a sibling Sin90 checkout already migrated \
+             to agent24-os-sdk (ME4-5.2.1) — this test must FAIL, not silently skip, when its \
+             prerequisite is missing (docs/agent/tasks.md T1.4.1 验收命令 #3)"
+        )
+    }));
+    assert!(
+        dir.join("Cargo.toml").is_file(),
+        "SIN90_CHECKOUT={} has no Cargo.toml at its root",
+        dir.display()
+    );
+    dir
+}
+
+/// Build Sin90 with its own `test-hooks` feature (needed for its `POST
+/// /debug/kernel-roundtrip` route, which both T1.4.1 tests below use as
+/// Sin90's own memory-recall probe). Mirrors Sin90's own
+/// `build_sin90_with_test_hooks` — a DEDICATED `--target-dir` under the
+/// Sin90 checkout itself, not this crate's `target/`, so this build uses
+/// Sin90's own `Cargo.lock`/dependency graph exactly as Sin90's own CI would,
+/// and does not collide with anything this crate's own `cargo test` builds.
+fn build_sin90_with_test_hooks(checkout: &Path) -> PathBuf {
+    let target_dir = checkout.join("target/test-hooks-debug");
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--bin",
+            "sin90",
+            "--features",
+            "test-hooks",
+            "--target-dir",
+        ])
+        .arg(&target_dir)
+        .current_dir(checkout)
+        .status()
+        .expect("could not run cargo build for sin90 (test-hooks)");
+    assert!(
+        status.success(),
+        "cargo build --features test-hooks --bin sin90 (in {}) failed",
+        checkout.display()
+    );
+    let bin = target_dir.join("debug/sin90");
+    assert!(
+        bin.is_file(),
+        "expected {} to exist after build",
+        bin.display()
+    );
+    bin
+}
+
+/// Install Sin90 as a real out-of-process package next to Cos72's own, in
+/// the SAME `packages_root` (proving both can share one real `agent24d`
+/// install — T1.4.1's whole point). Unlike Sin90's own `install_sin90`
+/// (which lives INSIDE the Sin90 crate and can `include_bytes!("../domain-os.yml")`
+/// at compile time), this crate is not Sin90's crate — `domain-os.yml` is
+/// read from `sin90_checkout` at RUNTIME instead. The kernel's own
+/// `manifest_digest` check still compares raw file bytes
+/// (`agent24-os-packages::discovery`), so this must still be an exact byte
+/// copy of Sin90's real, checked-in manifest, not a hand-typed one — reading
+/// the real file off disk is what guarantees that, the same guarantee
+/// `include_bytes!` gives Sin90's own test, just obtained a different way.
+fn install_sin90(packages_root: &Path, sin90_checkout: &Path, sin90_bin: &Path) {
+    let dir = packages_root.join("sin90");
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let manifest = std::fs::read(sin90_checkout.join("domain-os.yml")).unwrap_or_else(|e| {
+        panic!(
+            "could not read {}/domain-os.yml: {e}",
+            sin90_checkout.display()
+        )
+    });
+    std::fs::write(dir.join("domain-os.yml"), manifest).unwrap();
+    std::fs::copy(sin90_bin, dir.join("bin/sin90")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = std::fs::metadata(dir.join("bin/sin90"))
+            .unwrap()
+            .permissions();
+        perm.set_mode(0o755);
+        std::fs::set_permissions(dir.join("bin/sin90"), perm).unwrap();
+    }
+}
+
+/// A general HTTP call over the real proxy, with an OPTIONAL actor-key
+/// header — unlike [`http_get`]/[`http_post`] (Cos72's own routes need no
+/// actor key at all, Q1's own recorded decision), Sin90's routes are gated
+/// by `x-sin90-actor-key` (`http::actor::ActorKeys`), and this test drives
+/// several of them (`/reviews`, `/reviews/{id}` PATCH, `/reviews/{id}/finalize`,
+/// `/routines`, `/debug/kernel-roundtrip`). Mirrors Sin90's own `http_call`.
+fn http_call(
+    port: u16,
+    method: &str,
+    path: &str,
+    daemon_token: Option<&str>,
+    actor_key: Option<&str>,
+    body: Option<&str>,
+) -> Option<(u16, String)> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let auth = daemon_token
+        .map(|t| format!("authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let actor = actor_key
+        .map(|k| format!("x-sin90-actor-key: {k}\r\n"))
+        .unwrap_or_default();
+    let body = body.unwrap_or("");
+    write!(
+        s,
+        "{method} {path} HTTP/1.1\r\nhost: x\r\n{auth}{actor}content-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .ok()?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).ok()?;
+    let status = raw.split(' ').nth(1)?.parse().ok()?;
+    let resp_body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_owned())?;
+    Some((status, resp_body))
+}
+
+/// Every file named `name` found anywhere under `dir` (depth-first) — used
+/// only to find Sin90's `actor-keys.json` without hard-coding Agent24's own
+/// data-dir layout, same reasoning as Sin90's own `find_file`.
+fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.file_name().is_some_and(|n| n == name) {
+            return Some(path);
+        }
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            if let Some(found) = find_file(&path, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+impl Daemon {
+    /// Sin90's own human actor key, persisted to `<A24_DATA_DIR>/actor-keys.json`
+    /// under this test's isolated `HOME` (mirrors Sin90's own
+    /// `Daemon::read_actor_key` — Agent24's module launch passes only a
+    /// fixed env allowlist, so a `SIN90_*` env var cannot reach a mounted
+    /// module). Also asserts the raw key never leaked into the daemon log
+    /// (Agent24 re-logs every module output line).
+    fn read_actor_key(&self, home: &Path, which: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        let path = loop {
+            if let Some(p) = find_file(home, "actor-keys.json") {
+                break p;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "sin90 never created actor-keys.json under {}; daemon log:\n{}",
+                home.display(),
+                self.combined_log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let keys: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let key = keys[which]
+            .as_str()
+            .unwrap_or_else(|| panic!("no {which:?} key in {}: {keys}", path.display()))
+            .to_owned();
+        assert!(
+            !self.combined_log().contains(&key),
+            "the raw {which} actor key leaked into the daemon log"
+        );
+        key
+    }
+}
+
+/// Polls `GET /api/v1/cos72/health` through the real proxy until it answers
+/// 200 — the same "mounted in `/api/v1/os` can race ahead of ready to serve
+/// a proxied request" race every other Cos72 test in this file retries
+/// around inline; factored out here because both T1.4.1 tests need it.
+fn wait_for_cos72_ready(d: &Daemon, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some((200, _)) = http_get(d.port, Some(&d.token), "/api/v1/cos72/health") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cos72 never answered /health through the real proxy; daemon log:\n{}",
+            d.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Same race, for Sin90's side: `os list` reporting `mounted` then Sin90's
+/// own side-effect-free `GET /today` actually answering (Sin90's own
+/// `wait_for_sin90_ready` in its own `tests/agent24_mount_blackbox.rs`).
+fn wait_for_sin90_ready(d: &Daemon, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if os_list_entry(d, "sin90")["state"] == "mounted" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sin90 never reached state \"mounted\"; daemon log:\n{}",
+            d.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some((200, _)) = http_get(d.port, Some(&d.token), "/api/v1/sin90/today") {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sin90 never answered /today through the real proxy; daemon log:\n{}",
+            d.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// The KERNEL's own `GET /api/v1/schedules` — a top-level kernel route, not
+/// proxied to either module, gated only by the daemon bearer token (same as
+/// `GET /api/v1/os`). docs/agent/tasks.md T1.4.1 own note: "调度隔离从内核
+/// REST 侧验，是 ME4-S3 §8 Q4 明确允许的路径" — this is that REST side.
+fn kernel_schedules(d: &Daemon) -> serde_json::Value {
+    let (status, body) = http_get(d.port, Some(&d.token), "/api/v1/schedules")
+        .unwrap_or_else(|| panic!("no response from GET /api/v1/schedules"));
+    assert_eq!(status, 200, "{body}");
+    serde_json::from_str(&body).unwrap()
+}
+
+/// `POST /api/v1/sin90/routines` with the human actor key, through the real
+/// proxy — mirrors Sin90's own `create_routine`.
+fn create_routine(d: &Daemon, human_key: &str, body: &str) -> serde_json::Value {
+    let (status, resp) = http_call(
+        d.port,
+        "POST",
+        "/api/v1/sin90/routines",
+        Some(&d.token),
+        Some(human_key),
+        Some(body),
+    )
+    .unwrap();
+    assert_eq!(status, 201, "POST /routines: {resp}");
+    serde_json::from_str(&resp).unwrap()
+}
+
+/// Polls `GET /api/v1/schedules` until at least one row is owned by `module`
+/// — Sin90's own Routine→kernel sync goes through its outbox/reconciler
+/// (Sin90's own `routine_m3_real_mount_acceptance` polls the identical way,
+/// `wait_for_one_schedule_row`), not synchronously with the `POST /routines`
+/// call that creates it.
+fn wait_for_any_schedule_row_owned_by(
+    d: &Daemon,
+    module: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let schedules = kernel_schedules(d);
+        if let Some(row) = schedules["schedules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["owner"]["module"] == module)
+        {
+            return row.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no schedule row owned by {module:?} appeared within {timeout:?}; last: {schedules}; \
+             daemon log:\n{}",
+            d.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Runs Cos72's ordinary task → award → advise → approve → credited → memory
+/// flow to completion and returns the resulting `cos72:task:<id>:completed`
+/// dedup_key — shared by both T1.4.1 tests below (`cos72_full_flow_real_mount`'s
+/// own "does the flow still work when Sin90 is co-mounted" check, and
+/// `cos72_and_sin90_coexist_isolated`'s own "Cos72 can find ITS OWN marker"
+/// positive control) instead of duplicating the publish/claim/submit/approve
+/// sequence `cos72_award_roundtrip_under_real_daemon` already exercises for
+/// Cos72 alone. `tag` disambiguates the task title/publisher/member across
+/// calls against the SAME daemon.
+fn cos72_complete_one_task(daemon: &Daemon, tag: &str) -> String {
+    let member = format!("mem-{tag}");
+    let publish_body = serde_json::json!({
+        "title": format!("coexist {tag}"),
+        "reward_points": 5,
+        "publisher": format!("pub-{tag}"),
+    });
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        "/api/v1/cos72/tasks",
+        &publish_body,
+    )
+    .unwrap_or_else(|| panic!("no response from POST /tasks"));
+    assert_eq!(
+        status,
+        201,
+        "daemon log:\n{}\nbody: {body}",
+        daemon.combined_log()
+    );
+    let task: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let task_id = task["task_id"].as_str().unwrap().to_owned();
+
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        &format!("/api/v1/cos72/tasks/{task_id}/claim"),
+        &serde_json::json!({"member": member}),
+    )
+    .unwrap();
+    assert_eq!(
+        status,
+        200,
+        "daemon log:\n{}\nbody: {body}",
+        daemon.combined_log()
+    );
+
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        &format!("/api/v1/cos72/tasks/{task_id}/submit"),
+        &serde_json::json!({"member": member}),
+    )
+    .unwrap();
+    assert_eq!(
+        status,
+        202,
+        "daemon log:\n{}\nbody: {body}",
+        daemon.combined_log()
+    );
+    let submitted: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let award_id = submitted["award"]["award_id"].as_str().unwrap().to_owned();
+
+    let pending = wait_for_get(daemon, "/api/v1/module-approvals?decision=pending", 200, 10);
+    let approval = pending["module_approvals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["module"] == "cos72" && a["payload"]["award_id"] == award_id)
+        .unwrap_or_else(|| panic!("no pending module-approval for award {award_id}: {pending}"));
+    let approval_id = approval["id"].as_str().unwrap().to_owned();
+
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        &format!("/api/v1/module-approvals/{approval_id}"),
+        &serde_json::json!({"decision": "approved"}),
+    )
+    .unwrap();
+    assert_eq!(
+        status,
+        200,
+        "daemon log:\n{}\nbody: {body}",
+        daemon.combined_log()
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let task = wait_for_get(daemon, &format!("/api/v1/cos72/tasks/{task_id}"), 200, 5);
+        if task["status"] == "completed" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task {task_id} never reached completed after approval; daemon log:\n{}",
+            daemon.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    let dedup_key = format!("cos72:task:{task_id}:completed");
+    let recall = wait_for_memory_recall(daemon, &dedup_key, 1, 20);
+    assert_eq!(recall["items"].as_array().unwrap().len(), 1, "{recall}");
+    dedup_key
+}
+
+/// docs/agent/tasks.md T1.4.1 目标: "全流程...两模块同时挂载时..." — the
+/// positive half. `cos72_award_roundtrip_under_real_daemon` (T1.3.1b)
+/// already proves Cos72's full task/award/approval/memory flow end to end
+/// WITH Cos72 mounted alone, including the denied path and a restart. This
+/// test does not repeat that coverage; its only new fact is that the SAME
+/// happy-path flow (and a restart) still completes correctly with a SECOND
+/// real out-of-process module (Sin90) mounted on the SAME kernel at the SAME
+/// time — proving the isolation assertions in `cos72_and_sin90_coexist_isolated`
+/// below are checking a system that otherwise still works, not one where
+/// Cos72 was simply broken/starved by sharing a daemon.
+#[test]
+#[ignore = "needs sibling Agent24 + Sin90 checkouts; run explicitly: AGENT24_CHECKOUT=... SIN90_CHECKOUT=... cargo test --features test-hooks --test agent24_mount_blackbox -- --ignored --test-threads=1"]
+fn cos72_full_flow_real_mount() {
+    let checkout = agent24_checkout().unwrap_or_else(|| {
+        panic!(
+            "no Agent24 checkout found (set AGENT24_CHECKOUT or place it at ../Agent24) — this \
+             test must FAIL, not silently skip, when its prerequisite is missing"
+        )
+    });
+    let sin90_checkout = sin90_checkout();
+    let agent24d_bin = build_agent24d(&checkout);
+    let cos72_bin = PathBuf::from(env!("CARGO_BIN_EXE_cos72"));
+    let sin90_bin = build_sin90_with_test_hooks(&sin90_checkout);
+
+    let home = tmp_home("full-flow-coexist");
+    install_cos72(&home.join(".agent24/packages"), &cos72_bin);
+    install_sin90(&home.join(".agent24/packages"), &sin90_checkout, &sin90_bin);
+
+    let daemon = start_daemon(&home, &agent24d_bin);
+    wait_for_cos72_ready(&daemon, Duration::from_secs(30));
+    wait_for_sin90_ready(&daemon, Duration::from_secs(30));
+    assert_eq!(
+        os_list_entry(&daemon, "cos72")["state"],
+        "mounted",
+        "daemon log:\n{}",
+        daemon.combined_log()
+    );
+    assert_eq!(
+        os_list_entry(&daemon, "sin90")["state"],
+        "mounted",
+        "daemon log:\n{}",
+        daemon.combined_log()
+    );
+
+    let dedup_key = cos72_complete_one_task(&daemon, "full-flow");
+    let balance = wait_for_get(&daemon, "/api/v1/cos72/points/mem-full-flow", 200, 5);
+    assert_eq!(balance["balance"], 5, "{balance}");
+
+    // ---- restart: both modules re-mount, balance + memory both survive ----
+    drop(daemon);
+    let daemon2 = start_daemon(&home, &agent24d_bin);
+    wait_for_cos72_ready(&daemon2, Duration::from_secs(30));
+    wait_for_sin90_ready(&daemon2, Duration::from_secs(30));
+    let balance_after_restart =
+        wait_for_get(&daemon2, "/api/v1/cos72/points/mem-full-flow", 200, 10);
+    assert_eq!(
+        balance_after_restart["balance"], 5,
+        "balance must survive a restart with sin90 co-mounted unchanged: {balance_after_restart}"
+    );
+    let recall_after_restart = wait_for_memory_recall(&daemon2, &dedup_key, 1, 15);
+    assert_eq!(
+        recall_after_restart["items"].as_array().unwrap().len(),
+        1,
+        "memory must survive a restart with sin90 co-mounted unchanged, not be re-written: \
+         {recall_after_restart}"
+    );
+}
+
+/// docs/agent/tasks.md T1.4.1 验收命令 #2 — the actual isolation contract,
+/// under ONE real `agent24d` with a real `cos72` AND a real `sin90` mounted
+/// at the same time:
+///
+/// - `GET /api/v1/os`: both `mounted`.
+/// - Memory: each module's own recall finds its OWN marker/dedup_key (正对照,
+///   ≥ 1); Cos72's `/debug/memory-recall` for Sin90's own fixed debug-route
+///   marker (`kernel_roundtrip.rs`'s `"t3.2.3-kernel-clients-roundtrip"` —
+///   this test's `M_s`) → 0; Sin90's own debug route, asked to recall Cos72's
+///   completion dedup_key → 0.
+/// - Schedules: a Sin90 Routine produces an `owner_module=sin90` row in the
+///   KERNEL's own `GET /api/v1/schedules` (正对照); `owner_module=cos72`
+///   stays at 0 — the structural reason being Cos72's manifest never
+///   requests `scheduler` at all (re-checked here directly against
+///   `/health`'s own capabilities, docs/agent/tasks.md T1.4.1's own note:
+///   "Cos72 `/health` 的 capabilities 不含 `_a24/scheduler/`").
+///
+/// docs/agent/tasks.md T1.4.1 验收命令 #3 ("前置缺失即失败：不设
+/// `SIN90_CHECKOUT` 时该测试 panic") is [`sin90_checkout`]'s own behavior,
+/// exercised by every test in this section — not re-tested as its own
+/// `#[test]` here (a test that panics under its own normal, `SIN90_CHECKOUT`-set
+/// preconditions would defeat its own purpose); the PR body records one real
+/// run with the var unset instead.
+#[test]
+#[ignore = "needs sibling Agent24 + Sin90 checkouts; run explicitly: AGENT24_CHECKOUT=... SIN90_CHECKOUT=... cargo test --features test-hooks --test agent24_mount_blackbox -- --ignored --test-threads=1"]
+fn cos72_and_sin90_coexist_isolated() {
+    let checkout = agent24_checkout().unwrap_or_else(|| {
+        panic!(
+            "no Agent24 checkout found (set AGENT24_CHECKOUT or place it at ../Agent24) — this \
+             test must FAIL, not silently skip, when its prerequisite is missing"
+        )
+    });
+    let sin90_checkout = sin90_checkout();
+    let agent24d_bin = build_agent24d(&checkout);
+    let cos72_bin = PathBuf::from(env!("CARGO_BIN_EXE_cos72"));
+    let sin90_bin = build_sin90_with_test_hooks(&sin90_checkout);
+
+    let home = tmp_home("coexist-isolated");
+    install_cos72(&home.join(".agent24/packages"), &cos72_bin);
+    install_sin90(&home.join(".agent24/packages"), &sin90_checkout, &sin90_bin);
+
+    let daemon = start_daemon(&home, &agent24d_bin);
+    wait_for_cos72_ready(&daemon, Duration::from_secs(30));
+    wait_for_sin90_ready(&daemon, Duration::from_secs(30));
+
+    // ---- both mounted ----
+    assert_eq!(
+        os_list_entry(&daemon, "cos72")["state"],
+        "mounted",
+        "daemon log:\n{}",
+        daemon.combined_log()
+    );
+    assert_eq!(
+        os_list_entry(&daemon, "sin90")["state"],
+        "mounted",
+        "daemon log:\n{}",
+        daemon.combined_log()
+    );
+
+    // ---- Cos72 structurally never holds `scheduler` (T1.1.1's own bar,
+    // re-checked here because it is the load-bearing fact behind the
+    // owner_module=cos72 == 0 assertion at the end of this test) ----
+    let (status, body) =
+        http_get(daemon.port, Some(&daemon.token), "/api/v1/cos72/health").unwrap();
+    assert_eq!(status, 200, "{body}");
+    let health: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let caps: Vec<&str> = health["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    assert!(
+        !caps.iter().any(|c| c.starts_with("_a24/scheduler/")),
+        "cos72 must not hold the scheduler capability: {caps:?}"
+    );
+
+    // ---- Cos72 produces (and can recall) its OWN memory marker ----
+    let cos72_dedup_key = cos72_complete_one_task(&daemon, "isolation");
+
+    // ---- Sin90 produces (and can recall) its OWN memory marker: a real,
+    // finalized Review (mirrors Sin90's own t441_finalized_review_summary_
+    // is_recallable_from_kernel_memory) ----
+    let human_key = daemon.read_actor_key(&home, "human", Duration::from_secs(10));
+    let (status, body) = http_call(
+        daemon.port,
+        "POST",
+        "/api/v1/sin90/reviews",
+        Some(&daemon.token),
+        Some(&human_key),
+        Some(r#"{"kind":"daily","period":"2026-09-30"}"#),
+    )
+    .unwrap();
+    assert_eq!(status, 201, "POST /reviews: {body}");
+    let review: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let review_id = review["id"].as_str().unwrap().to_owned();
+
+    let (status, body) = http_call(
+        daemon.port,
+        "PATCH",
+        &format!("/api/v1/sin90/reviews/{review_id}"),
+        Some(&daemon.token),
+        Some(&human_key),
+        Some(r#"{"body":"T1.4.1 coexist isolation marker"}"#),
+    )
+    .unwrap();
+    assert_eq!(status, 200, "PATCH /reviews/{{id}}: {body}");
+
+    let (status, body) = http_call(
+        daemon.port,
+        "POST",
+        &format!("/api/v1/sin90/reviews/{review_id}/finalize"),
+        Some(&daemon.token),
+        Some(&human_key),
+        Some("{}"),
+    )
+    .unwrap();
+    assert_eq!(status, 200, "POST /reviews/{{id}}/finalize: {body}");
+    let sin90_dedup_key = format!("review:{review_id}");
+
+    // Sin90's own debug route: its `memory_recall_query` param drives an
+    // EXTRA `_a24/memory/private/recall` call on Sin90's behalf, alongside
+    // that same call's OWN fixed remember/recall probe (kind
+    // `t3.2.3.debug`, body `{"probe":"t3.2.3-kernel-clients-roundtrip"}`) —
+    // this test's `M_s`, written by every call this closure makes.
+    const SIN90_DEBUG_PROBE_MARKER: &str = "t3.2.3-kernel-clients-roundtrip";
+    let sin90_recall_extra = |query: &str| -> Vec<serde_json::Value> {
+        let (status, body) = http_call(
+            daemon.port,
+            "POST",
+            "/api/v1/sin90/debug/kernel-roundtrip",
+            Some(&daemon.token),
+            Some(&human_key),
+            Some(&serde_json::json!({"memory_recall_query": query}).to_string()),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "no response from sin90 debug/kernel-roundtrip; daemon log:\n{}",
+                daemon.combined_log()
+            )
+        });
+        assert_eq!(
+            status,
+            200,
+            "POST /debug/kernel-roundtrip: {body}; daemon log:\n{}",
+            daemon.combined_log()
+        );
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        value["memory"]["recall_extra"]["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no memory.recall_extra.items in response: {value}"))
+            .clone()
+    };
+
+    // 正对照: Sin90 finds its OWN review's dedup_key (the real reconciler
+    // pump lands it asynchronously — poll, same reasoning as t441's own
+    // wait loop).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let items = sin90_recall_extra(&sin90_dedup_key);
+        if items
+            .iter()
+            .any(|it| it["body"]["dedup_key"] == sin90_dedup_key)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sin90 never landed its own review memory for {sin90_dedup_key}; daemon log:\n{}",
+            daemon.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // ---- cross-module memory isolation ----
+    // Cos72 queries for Sin90's own fixed debug-route marker (M_s) -> 0.
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        "/api/v1/cos72/debug/memory-recall",
+        &serde_json::json!({"query": SIN90_DEBUG_PROBE_MARKER}),
+    )
+    .unwrap();
+    assert_eq!(status, 200, "{body}");
+    let cross_from_cos72: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        cross_from_cos72["items"].as_array().unwrap().len(),
+        0,
+        "cos72 must not see sin90's private memory (M_s={SIN90_DEBUG_PROBE_MARKER:?}): \
+         {cross_from_cos72}"
+    );
+
+    // Sin90 queries for Cos72's own completion dedup_key -> 0 matches.
+    let cross_from_sin90 = sin90_recall_extra(&cos72_dedup_key);
+    let cross_from_sin90_matches = cross_from_sin90
+        .iter()
+        .filter(|it| it["body"]["dedup_key"] == cos72_dedup_key)
+        .count();
+    assert_eq!(
+        cross_from_sin90_matches, 0,
+        "sin90 must not see cos72's private memory (dedup_key={cos72_dedup_key:?}): \
+         {cross_from_sin90:?}"
+    );
+
+    // ---- schedule isolation ----
+    let _routine = create_routine(
+        &daemon,
+        &human_key,
+        r#"{"title":"coexist isolation routine","kind":"exercise","cron":"0 7 * * MON,WED,FRI","target_count":3}"#,
+    );
+    // 正对照: at least one owner_module=sin90 row appears (async, via
+    // Sin90's own outbox/reconciler — same race routine_m3_real_mount_
+    // acceptance's own `wait_for_one_schedule_row` retries around).
+    let sin90_row = wait_for_any_schedule_row_owned_by(&daemon, "sin90", Duration::from_secs(20));
+    assert_eq!(sin90_row["owner"]["module"], "sin90", "{sin90_row}");
+
+    let schedules = kernel_schedules(&daemon);
+    let cos72_rows = schedules["schedules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["owner"]["module"] == "cos72")
+        .count();
+    assert_eq!(
+        cos72_rows, 0,
+        "cos72 must own zero schedule rows (it never requests scheduler): {schedules}"
+    );
 }
