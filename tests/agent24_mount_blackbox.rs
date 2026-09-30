@@ -126,6 +126,37 @@ fn http_get(port: u16, daemon_token: Option<&str>, path: &str) -> Option<(u16, S
     Some((status, resp_body))
 }
 
+/// Same wire-level reasoning as [`http_get`] — a real POST through the real
+/// kernel proxy, so `cos72_task_routes_through_real_proxy` observes the
+/// same 401-without-token boundary any other route does (docs/agent/tasks.md
+/// T1.2.1 验收命令 #4: "只用真实 agent24d + 真实 cos72", not axum's own
+/// in-process `oneshot`).
+fn http_post(
+    port: u16,
+    daemon_token: Option<&str>,
+    path: &str,
+    body: &serde_json::Value,
+) -> Option<(u16, String)> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let auth = daemon_token
+        .map(|t| format!("authorization: Bearer {t}\r\n"))
+        .unwrap_or_default();
+    let payload = body.to_string();
+    write!(
+        s,
+        "POST {path} HTTP/1.1\r\nhost: x\r\n{auth}content-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{payload}",
+        payload.len()
+    )
+    .ok()?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw).ok()?;
+    let status = raw.split(' ').nth(1)?.parse().ok()?;
+    let resp_body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_owned())?;
+    Some((status, resp_body))
+}
+
 /// Graceful-first on every exit path (unwind included) — same reasoning as
 /// Sin90's / Agent24's own `Running`: a plain `Child` drop does not
 /// terminate the OS process, and an unconditional SIGKILL has been observed
@@ -396,4 +427,141 @@ fn cos72_mounts_and_answers_health() {
         status, 401,
         "GET /health with no daemon token must be rejected by the kernel: {body}"
     );
+}
+
+/// docs/agent/tasks.md T1.2.1 验收命令 #4: a real `agent24d` + real `cos72`,
+/// publish → claim → submit through the real proxy, `GET /tasks/{id}` ends up
+/// `submitted`, and the WS boundary observes `task.published`, `task.claimed`,
+/// `task.submitted` (each `module=cos72`, carrying this `task_id`) in order.
+#[test]
+#[ignore = "needs a sibling Agent24 checkout; run explicitly: cargo test --test agent24_mount_blackbox -- --ignored --test-threads=1"]
+fn cos72_task_routes_through_real_proxy() {
+    let checkout = agent24_checkout().unwrap_or_else(|| {
+        panic!(
+            "no Agent24 checkout found (set AGENT24_CHECKOUT or place it at ../Agent24) — this \
+             test must FAIL, not silently skip, when its prerequisite is missing"
+        )
+    });
+    let agent24d_bin = build_agent24d(&checkout);
+    let cos72_bin = PathBuf::from(env!("CARGO_BIN_EXE_cos72"));
+
+    let home = tmp_home("task-routes");
+    install_cos72(&home.join(".agent24/packages"), &cos72_bin);
+
+    let daemon = start_daemon(&home, &agent24d_bin);
+    let events = spawn_ws_subscriber(daemon.port, &daemon.token);
+
+    // Same "wait for the real proxy, not just the module list" race as
+    // `cos72_mounts_and_answers_health` above.
+    let ready_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some((200, _)) = http_get(daemon.port, Some(&daemon.token), "/api/v1/cos72/health") {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "cos72 never answered /health through the real proxy; daemon log:\n{}",
+            daemon.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let publish_body =
+        serde_json::json!({"title": "real mount task", "reward_points": 10, "publisher": "pub1"});
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        "/api/v1/cos72/tasks",
+        &publish_body,
+    )
+    .unwrap_or_else(|| panic!("no response from POST /tasks"));
+    assert_eq!(
+        status,
+        201,
+        "daemon log:\n{}\nbody: {body}",
+        daemon.combined_log()
+    );
+    let task: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let task_id = task["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no task_id in publish response: {body}"))
+        .to_owned();
+
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        &format!("/api/v1/cos72/tasks/{task_id}/claim"),
+        &serde_json::json!({"member": "mem1"}),
+    )
+    .unwrap_or_else(|| panic!("no response from POST /claim"));
+    assert_eq!(
+        status,
+        200,
+        "daemon log:\n{}\nbody: {body}",
+        daemon.combined_log()
+    );
+
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        &format!("/api/v1/cos72/tasks/{task_id}/submit"),
+        &serde_json::json!({"member": "mem1"}),
+    )
+    .unwrap_or_else(|| panic!("no response from POST /submit"));
+    assert_eq!(
+        status,
+        202,
+        "daemon log:\n{}\nbody: {body}",
+        daemon.combined_log()
+    );
+
+    let (status, body) = http_get(
+        daemon.port,
+        Some(&daemon.token),
+        &format!("/api/v1/cos72/tasks/{task_id}"),
+    )
+    .unwrap_or_else(|| panic!("no response from GET /tasks/{{id}}"));
+    assert_eq!(
+        status,
+        200,
+        "daemon log:\n{}\nbody: {body}",
+        daemon.combined_log()
+    );
+    let task: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(task["status"], "submitted", "{body}");
+
+    // WS boundary observed the three events, in order, each carrying this
+    // task_id — the subscriber started before any of the three calls above.
+    let expected_kinds = ["task.published", "task.claimed", "task.submitted"];
+    let mut next = 0;
+    let overall_deadline = Instant::now() + Duration::from_secs(30);
+    while next < expected_kinds.len() {
+        let remaining = overall_deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "never observed {:?} on the real WS boundary (saw {next} of {}); daemon log:\n{}",
+            expected_kinds[next],
+            expected_kinds.len(),
+            daemon.combined_log()
+        );
+        match events.recv_timeout(remaining.min(Duration::from_secs(5))) {
+            Ok(event)
+                if event["type"] == "module"
+                    && event["payload"]["module"] == "cos72"
+                    && event["payload"]["kind"] == expected_kinds[next]
+                    && event["payload"]["payload"]["task_id"] == task_id =>
+            {
+                next += 1;
+            }
+            Ok(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "WS subscriber thread ended after {next} of {} events; daemon log:\n{}",
+                    expected_kinds.len(),
+                    daemon.combined_log()
+                )
+            }
+        }
+    }
 }
