@@ -45,6 +45,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
+    // docs/agent/spec.md「记忆泵」: only spawn the pump when the kernel
+    // actually granted `memory` — with no memory capability there is
+    // nothing for it to drain into, and any `outbox` rows a future award
+    // credits simply stay `pending` (spec.md: "不报错").
+    if kernel.memory_available() {
+        drop(cos72::workers::memory_pump::spawn_loop(
+            store.clone(),
+            kernel.clone(),
+        ));
+    }
+
     let capabilities = Arc::new(module.offer().provides.clone());
     let app = router(Cos72State {
         capabilities,

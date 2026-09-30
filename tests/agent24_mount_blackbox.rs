@@ -457,6 +457,51 @@ fn wait_for_get(d: &Daemon, path: &str, want_status: u16, secs: u64) -> serde_js
     }
 }
 
+/// Polls the `test-hooks`-only `POST /debug/memory-recall` route (spec.md
+/// 「REST 路由」) until it reports at least `want_len` items for `query`, or
+/// panics at the deadline — the memory_pump only drains `outbox` on its own
+/// 2s tick (`workers::memory_pump::PUMP_INTERVAL`), so this is a genuine
+/// wait, not an immediate check.
+fn wait_for_memory_recall(
+    d: &Daemon,
+    query: &str,
+    want_len: usize,
+    secs: u64,
+) -> serde_json::Value {
+    let path = "/api/v1/cos72/debug/memory-recall";
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some((status, body)) = http_post(
+            d.port,
+            Some(&d.token),
+            path,
+            &serde_json::json!({"query": query}),
+        ) {
+            if status == 200 {
+                let value: serde_json::Value = serde_json::from_str(&body)
+                    .unwrap_or_else(|e| panic!("POST {path} returned non-JSON body {body:?}: {e}"));
+                let len = value["items"].as_array().map_or(0, Vec::len);
+                if len >= want_len {
+                    return value;
+                }
+            } else {
+                assert!(
+                    Instant::now() < deadline,
+                    "POST {path} never returned 200 (last: {status} {body}); daemon log:\n{}",
+                    d.combined_log()
+                );
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "POST {path} never reported >= {want_len} item(s) for {query:?} before the \
+             deadline; daemon log:\n{}",
+            d.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
 /// docs/agent/tasks.md T1.3.1 验收命令 #6 (T1.3.1a slice — the points half;
 /// T1.3.1b adds the memory-recall assertions on top of this same scenario):
 /// a real `agent24d` + real `cos72`, submit → the kernel's own
@@ -597,6 +642,18 @@ fn cos72_award_roundtrip_under_real_daemon() {
     let points = wait_for_get(&daemon, "/api/v1/cos72/points/mem1", 200, 5);
     assert_eq!(points["balance"], 7, "{points}");
 
+    // ---- Memory (T1.3.1b): the completion summary lands via outbox + the
+    // memory_pump — poll the test-hooks debug route until the pump (2s tick)
+    // has drained the row (spec.md「记忆泵」dedup_key = cos72:task:<id>:
+    // completed).
+    let dedup_key = format!("cos72:task:{task_id}:completed");
+    let recall = wait_for_memory_recall(&daemon, &dedup_key, 1, 20);
+    let items = recall["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{recall}");
+    assert_eq!(items[0]["body"]["task_id"], task_id, "{recall}");
+    assert_eq!(items[0]["body"]["award_id"], award_id, "{recall}");
+    assert_eq!(items[0]["body"]["dedup_key"], dedup_key, "{recall}");
+
     // ---- Path 2 (正对照): denied → back to claimed, balance unchanged ----
     let publish_body2 =
         serde_json::json!({"title": "denied task", "reward_points": 99, "publisher": "pub1"});
@@ -692,6 +749,17 @@ fn cos72_award_roundtrip_under_real_daemon() {
     assert_eq!(
         points_restarted["balance"], 7,
         "balance must survive a restart unchanged: {points_restarted}"
+    );
+
+    // Memory also survives the restart unchanged — it lives in the kernel's
+    // own on-disk store (same `home`), independent of Cos72's own process
+    // lifetime; still exactly one recollection for this dedup_key (no
+    // re-remembering on the new generation's own pump startup).
+    let recall_after_restart = wait_for_memory_recall(&daemon2, &dedup_key, 1, 15);
+    assert_eq!(
+        recall_after_restart["items"].as_array().unwrap().len(),
+        1,
+        "memory must survive a restart unchanged, not be re-written: {recall_after_restart}"
     );
 }
 
