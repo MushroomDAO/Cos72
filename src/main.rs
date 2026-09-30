@@ -23,12 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module = Module::builder(MANIFEST).connect().await?;
     tracing::info!(offer = ?module.offer().provides, "cos72: handshake accepted");
 
-    // Kept alive for the rest of `main` (the `_` prefix only silences the
-    // "never read again" lint — this binding is not dropped until the
-    // process exits, so the pool stays open for the whole run) even though
-    // no route touches it yet: T1.1.1's job is to prove a fresh install
-    // already carries the full schema (docs/agent/tasks.md T1.1.1 目标).
-    let _store = Cos72Store::open(&module.data_dir().join("cos72.db")).await?;
+    let store = Cos72Store::open(&module.data_dir().join("cos72.db")).await?;
 
     let kernel = SdkKernelPort::wire(&module);
     // docs/agent/spec.md「事件」: "启动握手成功后发一次 module.ready（黑盒可
@@ -36,7 +31,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     kernel.emit("module.ready", serde_json::Map::new());
 
     let capabilities = Arc::new(module.offer().provides.clone());
-    let app = router(Cos72State { capabilities });
+    let app = router(Cos72State {
+        capabilities,
+        store,
+        kernel: Arc::new(kernel),
+    });
     module.serve(app).await?;
     Ok(())
 }

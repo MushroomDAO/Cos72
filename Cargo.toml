@@ -25,6 +25,10 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ulid = "1"
+# T1.2.1 (docs/agent/spec.md「标识与校验」): RFC 3339 UTC millisecond-precision
+# timestamps for tasks/awards rows. `default-features = false` + `clock`:
+# only `Utc::now()` and formatting, no serde/wasm extras this crate doesn't use.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # ME4-5.3.2 (docs/agent/architecture.md 核心判断 1): the out-of-process
 # module SDK. Pinned by tag, not branch, same reasoning as Sin90's
 # Cargo.toml (docs/agent/architecture.md 核心判断 1 第三点): builds are

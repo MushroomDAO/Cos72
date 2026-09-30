@@ -1,13 +1,14 @@
 //! Cos72 persistence — sqlx over its OWN `cos72.db` (never the kernel's
 //! `agent24.db`, docs/agent/architecture.md 不可动摇的边界 #1: "SQLite 是
-//! 真相"). T1.1.1 only opens the pool and runs the full T1.1.1-scope
-//! migration (docs/agent/spec.md「数据模型」, all four tables); the
-//! repositories (`tasks.rs` / `ledger.rs`) are T1.2.1/T1.3.1.
+//! 真相"). T1.1.1 opened the pool and ran the full schema migration; T1.2.1
+//! adds the first repository (`tasks.rs`) — `ledger.rs` is T1.3.1.
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
+
+pub mod tasks;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -25,11 +26,6 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// `sqlx::SqlitePool`, same pattern Sin90's `Sin90Store` uses).
 #[derive(Clone)]
 pub struct Cos72Store {
-    // Not read outside this module's own tests yet — T1.1.1 has no
-    // repository code (docs/agent/tasks.md「明确不做」: "任务/奖励/账本的
-    // 业务代码"). T1.2.1's `store::tasks`/T1.3.1's `store::ledger` become the
-    // real callers of `pool()` below.
-    #[allow(dead_code)]
     pool: SqlitePool,
 }
 
@@ -85,13 +81,12 @@ impl Cos72Store {
         Ok(Self { pool })
     }
 
-    /// The underlying pool — `pub(crate)` so a future business repository
-    /// (T1.2.1's `store::tasks`, T1.3.1's `store::ledger`) is the real
-    /// caller; this module's own tests are the only caller today.
-    /// `tests/migrations.rs` (a separate integration-test crate) opens its
-    /// own pool directly against a temp file instead of reaching into this
-    /// one.
-    #[allow(dead_code)]
+    /// The underlying pool — `pub(crate)` so `store::tasks` (T1.2.1) and,
+    /// later, `store::ledger` (T1.3.1) are the real callers; `http::tasks`
+    /// never reaches into this directly, it only ever calls `store::tasks`
+    /// functions. `tests/migrations.rs` (a separate integration-test crate)
+    /// opens its own pool directly against a temp file instead of reaching
+    /// into this one.
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
     }
