@@ -1,8 +1,11 @@
 //! Cos72's axum routes. T1.1.1 scope was `GET /health` only; T1.2.1
 //! (docs/agent/tasks.md「开发范围」`src/http/tasks.rs`) adds the mytask
-//! routes (publish/list/get/claim/submit). `/points` (T1.3.1) and
-//! `/debug/*` (T1.3.1, `test-hooks`-only) are not registered here yet.
+//! routes (publish/list/get/claim/submit). T1.3.1a adds `/points`; T1.3.1b
+//! adds `/debug/memory-recall` (`test-hooks`-only, docs/agent/architecture.md
+//! 不可动摇的边界 #9).
 
+#[cfg(feature = "test-hooks")]
+pub mod debug;
 pub mod error;
 pub mod points;
 pub mod tasks;
@@ -44,7 +47,7 @@ impl<K> Clone for Cos72State<K> {
 }
 
 pub fn router<K: KernelPort>(state: Cos72State<K>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(health::<K>))
         .route(
             "/tasks",
@@ -54,8 +57,10 @@ pub fn router<K: KernelPort>(state: Cos72State<K>) -> Router {
         .route("/tasks/{id}/claim", post(tasks::claim_task::<K>))
         .route("/tasks/{id}/submit", post(tasks::submit_task::<K>))
         .route("/points", get(points::all_balances::<K>))
-        .route("/points/{member}", get(points::member_balance::<K>))
-        .with_state(state)
+        .route("/points/{member}", get(points::member_balance::<K>));
+    #[cfg(feature = "test-hooks")]
+    let router = router.route("/debug/memory-recall", post(debug::memory_recall::<K>));
+    router.with_state(state)
 }
 
 async fn health<K: KernelPort>(State(state): State<Cos72State<K>>) -> Json<Value> {

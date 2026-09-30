@@ -194,9 +194,18 @@ async fn credit_award_locked(
         .execute(&mut *conn)
         .await?;
 
+    // docs/agent/spec.md「记忆泵」: the outbox payload carries `title` too
+    // (for a human-readable summary) — read from `tasks` since `awards`
+    // itself never stores it.
+    let title: String = sqlx::query_scalar("SELECT title FROM tasks WHERE task_id = ?")
+        .bind(&task_id)
+        .fetch_one(&mut *conn)
+        .await?;
+
     let dedup_key = format!("cos72:task:{task_id}:completed");
     let payload = serde_json::json!({
         "task_id": task_id,
+        "title": title,
         "member": member,
         "points": points,
         "award_id": award_id,

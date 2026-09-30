@@ -5,19 +5,21 @@
 //! trait, never `agent24_os_sdk` types directly, so a unit test can drive
 //! the whole stack against [`RecordingKernelPort`] with no real kernel.
 //!
-//! T1.1.1 implemented `emit` for real; T1.3.1a (ME4-5.3.3b, this piece)
-//! implements `approval_available` / `advise` / `approval_status` for real,
-//! wired to `module.approval()` (docs/agent/architecture.md 核心判断 4:
-//! "发积分走 advise + 轮询 status"). `remember_once` stays a placeholder here
-//! — it is T1.3.1b's scope (memory pump), landed in a separate PR/branch per
-//! jason's 2026-09-30 split of ME4-5.3.3b into a money piece and a memory
-//! piece.
+//! T1.1.1 implemented `emit` for real; T1.3.1a (ME4-5.3.3b, money piece)
+//! implemented `approval_available` / `advise` / `approval_status` for real,
+//! wired to `module.approval()`. T1.3.1b (this piece, ME4-5.3.3b, memory
+//! piece — jason's 2026-09-30 split) implements `memory_available` /
+//! `remember_once` / `recall` for real, wired to `module.memory()`
+//! (docs/agent/architecture.md 核心判断 6: "记忆写入只经 Cos72 自己的 outbox，由
+//! 单一泵串行调 remember_once"). `recall` exists only so the `test-hooks`
+//! `/debug/memory-recall` route (spec.md「REST 路由」) can query the kernel's
+//! private memory directly for black-box verification.
 
 use std::future::Future;
 
 use agent24_os_sdk::{
     ApprovalAnswer, ApprovalClient, ApprovalSubmit, ClientError, EventSink, EventSinkConfig,
-    Module, RememberOnce, UnavailableCause,
+    MemoryClient, Module, RecallPage, RememberOnce, UnavailableCause,
 };
 use serde_json::{Map, Value};
 
@@ -59,31 +61,36 @@ pub trait KernelPort: Send + Sync + 'static {
         approval_id: &str,
     ) -> impl Future<Output = Result<ApprovalAnswer, ClientError>> + Send;
 
+    /// Whether this generation's handshake actually granted `memory`
+    /// (docs/agent/spec.md「记忆泵」: "没有 memory 能力（`module.memory()` 为
+    /// `None`）→ 泵不启动，outbox 行保持 `pending`，不报错") — checked once at
+    /// startup (`main.rs`, before spawning `workers::memory_pump`), not per
+    /// call.
+    fn memory_available(&self) -> bool;
+
     /// # Errors
-    /// See [`ClientError`]. T1.3.1a: still a placeholder
-    /// (`Unavailable { retryable: true, .. }`) — implemented for real in
-    /// T1.3.1b (memory pump), a separate branch/PR stacked on this one.
+    /// See [`ClientError`]. docs/agent/architecture.md 不可动摇的边界 #4:
+    /// only ever called from `workers::memory_pump` — never the HTTP handler
+    /// or the award poller (structurally checked, `tests/structure.rs`).
     fn remember_once(
         &self,
         kind: &str,
         dedup_key: &str,
         body: Map<String, Value>,
     ) -> impl Future<Output = Result<RememberOnce, ClientError>> + Send;
+
+    /// # Errors
+    /// See [`ClientError`]. Only used by the `test-hooks`-only
+    /// `/debug/memory-recall` route (spec.md「REST 路由」: "黑盒核对记忆与隔离
+    /// 用").
+    fn recall(
+        &self,
+        query: &str,
+        page_size: usize,
+    ) -> impl Future<Output = Result<RecallPage, ClientError>> + Send;
 }
 
-/// T1.3.1b's placeholder for the one capability this piece does not wire up
-/// yet (`remember_once`) — `retryable: true` because a caller that reaches
-/// this before T1.3.1b lands should retry, not treat "not implemented yet"
-/// as a permanent kernel refusal.
-fn not_implemented_yet() -> ClientError {
-    ClientError::Unavailable {
-        retryable: true,
-        cause: UnavailableCause::NoProvider,
-    }
-}
-
-/// The kernel genuinely did not grant `approval` at handshake — distinct
-/// from [`not_implemented_yet`] (a Cos72-side placeholder): this is a real,
+/// The kernel genuinely did not grant `approval` at handshake — a real,
 /// permanent fact about the current generation's `Offer`. `retryable: false`
 /// — a fresh advise/status call in the SAME generation will get the same
 /// answer; only a new generation (new handshake) could change it, and the
@@ -100,10 +107,20 @@ fn no_approval_capability() -> ClientError {
     }
 }
 
+/// Same posture as [`no_approval_capability`], for `memory`. `main.rs` never
+/// spawns `workers::memory_pump` when [`KernelPort::memory_available`] is
+/// `false`, so this only guards a call that should not happen in practice.
+fn no_memory_capability() -> ClientError {
+    ClientError::Unavailable {
+        retryable: false,
+        cause: UnavailableCause::NoProvider,
+    }
+}
+
 /// The production `KernelPort`: wraps the SDK's own `EventsClient` (via
-/// `EventSink`, its bounded-queue fire-and-forget sink) for `emit`, and the
-/// SDK's `ApprovalClient` for `advise`/`approval_status` (T1.3.1a).
-/// `remember_once` is still a T1.3.1b placeholder.
+/// `EventSink`, its bounded-queue fire-and-forget sink) for `emit`, the
+/// SDK's `ApprovalClient` for `advise`/`approval_status` (T1.3.1a), and the
+/// SDK's `MemoryClient` for `remember_once`/`recall` (T1.3.1b).
 pub struct SdkKernelPort {
     /// `None` when the kernel did not grant `events` at handshake (句柄可能
     /// 不在, docs/agent/architecture.md 不可动摇的边界 #6) — `emit` then
@@ -112,6 +129,9 @@ pub struct SdkKernelPort {
     /// `None` when the kernel did not grant `approval` at handshake — same
     /// "handle may not be there" posture.
     approval: Option<ApprovalClient>,
+    /// `None` when the kernel did not grant `memory` at handshake — same
+    /// posture.
+    memory: Option<MemoryClient>,
 }
 
 impl SdkKernelPort {
@@ -137,7 +157,18 @@ impl SdkKernelPort {
                  approval_unavailable"
             );
         }
-        Self { sink, approval }
+        let memory = module.memory();
+        if memory.is_none() {
+            tracing::warn!(
+                "cos72: kernel did not grant the memory capability; the memory pump will not \
+                 start, outbox rows stay pending"
+            );
+        }
+        Self {
+            sink,
+            approval,
+            memory,
+        }
     }
 }
 
@@ -167,13 +198,27 @@ impl KernelPort for SdkKernelPort {
         }
     }
 
+    fn memory_available(&self) -> bool {
+        self.memory.is_some()
+    }
+
     async fn remember_once(
         &self,
-        _kind: &str,
-        _dedup_key: &str,
-        _body: Map<String, Value>,
+        kind: &str,
+        dedup_key: &str,
+        body: Map<String, Value>,
     ) -> Result<RememberOnce, ClientError> {
-        Err(not_implemented_yet())
+        match &self.memory {
+            Some(client) => client.remember_once(kind, dedup_key, body, None).await,
+            None => Err(no_memory_capability()),
+        }
+    }
+
+    async fn recall(&self, query: &str, page_size: usize) -> Result<RecallPage, ClientError> {
+        match &self.memory {
+            Some(client) => client.recall(query, page_size, None, None).await,
+            None => Err(no_memory_capability()),
+        }
     }
 }
 
@@ -195,6 +240,22 @@ pub struct RecordingKernelPort {
     status_calls: std::sync::Mutex<Vec<String>>,
     status_answers:
         std::sync::Mutex<std::collections::HashMap<String, Result<ApprovalAnswer, ClientError>>>,
+    memory_available: std::sync::atomic::AtomicBool,
+    remember_calls: std::sync::Mutex<Vec<RememberCall>>,
+    remember_responses:
+        std::sync::Mutex<std::collections::VecDeque<Result<RememberOnce, ClientError>>>,
+    recall_calls: std::sync::Mutex<Vec<(String, usize)>>,
+    recall_responses: std::sync::Mutex<std::collections::VecDeque<Result<RecallPage, ClientError>>>,
+}
+
+/// One recorded `remember_once` call (docs/agent/tasks.md T1.3.1 验收命令
+/// #4 `pump_calls_remember_once_with_namespaced_dedup_key`).
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RememberCall {
+    pub kind: String,
+    pub dedup_key: String,
+    pub body: Map<String, Value>,
 }
 
 /// One recorded `advise` call — everything a T1.3.1a test needs to assert
@@ -228,6 +289,11 @@ impl Default for RecordingKernelPort {
             advise_responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
             status_calls: std::sync::Mutex::new(Vec::new()),
             status_answers: std::sync::Mutex::new(std::collections::HashMap::new()),
+            memory_available: std::sync::atomic::AtomicBool::new(true),
+            remember_calls: std::sync::Mutex::new(Vec::new()),
+            remember_responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            recall_calls: std::sync::Mutex::new(Vec::new()),
+            recall_responses: std::sync::Mutex::new(std::collections::VecDeque::new()),
         }
     }
 }
@@ -288,6 +354,46 @@ impl RecordingKernelPort {
             .expect("status_calls mutex poisoned")
             .clone()
     }
+
+    pub fn set_memory_available(&self, available: bool) {
+        self.memory_available
+            .store(available, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Queue the next `remember_once` call's answer (FIFO).
+    pub fn push_remember_response(&self, response: Result<RememberOnce, ClientError>) {
+        self.remember_responses
+            .lock()
+            .expect("remember_responses mutex poisoned")
+            .push_back(response);
+    }
+
+    /// Every `remember_once` call, in call order.
+    #[must_use]
+    pub fn remember_calls(&self) -> Vec<RememberCall> {
+        self.remember_calls
+            .lock()
+            .expect("remember_calls mutex poisoned")
+            .clone()
+    }
+
+    /// Queue the next `recall` call's answer (FIFO) — the `test-hooks`
+    /// `/debug/memory-recall` route's own tests use this.
+    pub fn push_recall_response(&self, response: Result<RecallPage, ClientError>) {
+        self.recall_responses
+            .lock()
+            .expect("recall_responses mutex poisoned")
+            .push_back(response);
+    }
+
+    /// Every `(query, page_size)` pair `recall` was called with, in order.
+    #[must_use]
+    pub fn recall_calls(&self) -> Vec<(String, usize)> {
+        self.recall_calls
+            .lock()
+            .expect("recall_calls mutex poisoned")
+            .clone()
+    }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -337,13 +443,46 @@ impl KernelPort for RecordingKernelPort {
             .unwrap_or_else(|| Err(ClientError::NotFound(approval_id.to_owned())))
     }
 
+    fn memory_available(&self) -> bool {
+        self.memory_available
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     async fn remember_once(
         &self,
-        _kind: &str,
-        _dedup_key: &str,
-        _body: Map<String, Value>,
+        kind: &str,
+        dedup_key: &str,
+        body: Map<String, Value>,
     ) -> Result<RememberOnce, ClientError> {
-        Err(not_implemented_yet())
+        self.remember_calls
+            .lock()
+            .expect("remember_calls mutex poisoned")
+            .push(RememberCall {
+                kind: kind.to_owned(),
+                dedup_key: dedup_key.to_owned(),
+                body,
+            });
+        self.remember_responses
+            .lock()
+            .expect("remember_responses mutex poisoned")
+            .pop_front()
+            .unwrap_or_else(|| {
+                panic!("RecordingKernelPort::remember_once called with no queued response left")
+            })
+    }
+
+    async fn recall(&self, query: &str, page_size: usize) -> Result<RecallPage, ClientError> {
+        self.recall_calls
+            .lock()
+            .expect("recall_calls mutex poisoned")
+            .push((query.to_owned(), page_size));
+        self.recall_responses
+            .lock()
+            .expect("recall_responses mutex poisoned")
+            .pop_front()
+            .unwrap_or_else(|| {
+                panic!("RecordingKernelPort::recall called with no queued response left")
+            })
     }
 }
 
@@ -407,6 +546,7 @@ mod tests {
         let port = SdkKernelPort {
             sink: Some(sink),
             approval: None,
+            memory: None,
         };
 
         let mut payload = Map::new();
@@ -429,6 +569,7 @@ mod tests {
         let port = SdkKernelPort {
             sink: None,
             approval: Some(approval),
+            memory: None,
         };
         assert!(port.approval_available());
 
@@ -483,6 +624,7 @@ mod tests {
         let port = SdkKernelPort {
             sink: None,
             approval: None,
+            memory: None,
         };
         assert!(!port.approval_available());
         let err = port

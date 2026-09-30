@@ -203,3 +203,49 @@ fn advise_call_site_checker_flags_a_planted_violation() {
     let fixture_text = "kernel.advise(&submit).await";
     assert!(fixture_text.contains(".advise("));
 }
+
+/// docs/agent/architecture.md 不可动摇的边界 #4: "`remember_once` 只由
+/// memory_pump 一个任务调用". `src/kernel/mod.rs` is allow-listed for the same
+/// reason as [`ADVISE_CALL_SITE_ALLOWED_FILES`] — it is where `KernelPort::
+/// remember_once`'s two implementations legitimately call the word
+/// `.remember_once(` (docs/agent/tasks.md T1.3.1 验收命令 #5
+/// `remember_once_called_only_from_memory_pump`).
+const REMEMBER_ONCE_CALL_SITE_ALLOWED_FILES: &[&str] =
+    &["src/workers/memory_pump.rs", "src/kernel/mod.rs"];
+
+#[test]
+fn remember_once_called_only_from_memory_pump() {
+    let src_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut hits = Vec::new();
+    for path in rust_files_under(&src_dir) {
+        let text = std::fs::read_to_string(&path).unwrap();
+        if !text.contains(".remember_once(") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !REMEMBER_ONCE_CALL_SITE_ALLOWED_FILES.contains(&rel.as_str()) {
+            hits.push(rel);
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        ".remember_once( must only appear in {REMEMBER_ONCE_CALL_SITE_ALLOWED_FILES:?}, also \
+         found in: {hits:?}"
+    );
+}
+
+/// 正对照 for the `remember_once` call-site checker itself.
+#[test]
+fn remember_once_call_site_checker_flags_a_planted_violation() {
+    let fixture_rel = "src/http/tasks.rs";
+    assert!(
+        !REMEMBER_ONCE_CALL_SITE_ALLOWED_FILES.contains(&fixture_rel),
+        "fixture path must not already be allow-listed"
+    );
+    let fixture_text = "kernel.remember_once(kind, dedup_key, body).await";
+    assert!(fixture_text.contains(".remember_once("));
+}
