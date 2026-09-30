@@ -33,7 +33,7 @@
 | T1.2.1 | ME4-5.3.3a | T1.1.1 | `BACKLOG` |
 | T1.3.1 | ME4-5.3.3b | T1.2.1 | `BACKLOG` |
 | T1.4.1 | ME4-5.3.4 | T1.3.1 + ME4-5.2.1（Sin90 迁到 SDK） | `BACKLOG` |
-| T2.1.1 | ME4-6.0.2（Cos72 部分） | T1.4.1 + ME4-6.0.1（发布清单冻结） | `BACKLOG` |
+| T2.1.1 | ME4-6.0.2（Cos72 部分） | T1.4.1 + ME4-6.0.1（发布清单冻结） | `IN_PROGRESS` |
 
 **需 jason 手动做（不是 goal task）**：① 给 `MushroomDAO/Cos72` main 开 ruleset（1 个审批 + dismiss stale）；② 确认 PR-Daemon（clestons）监听 `MushroomDAO/Cos72`（开放问题 Q7）。
 
@@ -174,9 +174,31 @@
 
 ## F2.1 — 打包与 Release（M2）
 
-### T2.1.1 可安装包 + SHA256SUMS + GitHub Release（ME4-6.0.2 的 Cos72 部分）  `BACKLOG`
+### T2.1.1 可安装包 + SHA256SUMS + GitHub Release（ME4-6.0.2 的 Cos72 部分）  `IN_PROGRESS`
 - **优先级**：mid
 - **目标**：按 ME4-6.0.1 冻结的清单产出 Cos72 发布物。
 - **依赖**：T1.4.1、ME4-6.0.1
-- **验收命令**：按 ME4-6.0.1 清单逐项（文件名、`shasum -a 256 -c SHA256SUMS` 通过、`tar -tzf` 恰含 `domain-os.yml` 与 `bin/cos72`）；细节待清单冻结后展开。
-- **证据**：
+- **验收命令**：
+  1. `cd scripts/.. && bash scripts/package.sh` 以 exit code 0 结束（脚本自带自检，任何一项不
+     符合就非 0 退出，见下）；只在 `uname -sm` 为 `Darwin arm64` 上跑。
+  2. `cd dist && shasum -a 256 -c SHA256SUMS` 输出 `cos72-<ver>-macos-arm64.tar.gz: OK`
+     （脚本末尾已内置此检查，此处为人工复核）。
+  3. `tar -tzf dist/cos72-<ver>-macos-arm64.tar.gz | grep -v '/$'` 只列出两行：
+     `cos72-<ver>-macos-arm64/domain-os.yml` 与 `cos72-<ver>-macos-arm64/bin/cos72`
+     （脚本末尾已内置此检查）。
+  4. `tar -tvzf dist/cos72-<ver>-macos-arm64.tar.gz | grep bin/cos72` 权限位含 `x`
+     （二进制可执行）。
+  5. GitHub Release 部分（上传 tarball + SHA256SUMS 到 `MushroomDAO/Cos72` Release）
+     待 ME4-6.0.1 清单正式冻结后再做 —— 本片只做本地打包脚本 + 本地验证，不 push/开
+     PR/打 tag/发 Release。
+  正对照：把 `scripts/package.sh` 里 stage 阶段的 `cp domain-os.yml …` 一行删掉重跑 →
+  tar 内容自检那步应失败并非 0 退出（已实测，见下方证据）。
+- **涉及文件**：`scripts/package.sh`、`README.md`（新增「安装发布包」小节）、
+  `docs/agent/tasks.md`。
+- **证据**：2026-09-30 本地实测（Darwin arm64，rustc 1.95.0）：`bash scripts/package.sh`
+  跑通，产出 `dist/cos72-0.1.0-macos-arm64.tar.gz`（2,877,771 字节）+ `dist/SHA256SUMS`；
+  `shasum -a 256 -c SHA256SUMS` → `OK`；`tar -tzf` 恰好两个文件条目
+  （`domain-os.yml`、`bin/cos72`，后者 `-rwxr-xr-x` 可执行）。`migrations/` 未纳入包 ——
+  `src/store/mod.rs` 用的是编译期宏 `sqlx::migrate!("./migrations")`（非运行时
+  `Migrator::new`），migrations 已嵌进二进制，脚本对此做了 grep 断言。`dist/` 未提交
+  （已在 `.gitignore` 的既有 `dist` 规则覆盖范围内，未新增条目）。

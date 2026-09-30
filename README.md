@@ -45,6 +45,19 @@ lists every case without running any of them (useful to confirm the file
 still compiles, or to check the count docs/agent/tasks.md's own acceptance
 commands expect, without paying for a real mount).
 
+## 安装发布包
+
+从 Release 下载 `cos72-<版本>-macos-arm64.tar.gz` 和 `SHA256SUMS`，放在同一目录：
+
+```sh
+shasum -a 256 -c SHA256SUMS
+tar -xzf cos72-<版本>-macos-arm64.tar.gz
+agent24 os install cos72-<版本>-macos-arm64/
+```
+
+（发布包由 `scripts/package.sh` 产出：解包后的目录里只有 `domain-os.yml` 和
+`bin/cos72` 两个文件 —— migrations 在编译期已经嵌进了二进制。）
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](https://opensource.org/licenses/Apache-2.0). See [LICENSE](./LICENSE) for details.
