@@ -4,6 +4,7 @@
 //! `/debug/*` (T1.3.1, `test-hooks`-only) are not registered here yet.
 
 pub mod error;
+pub mod points;
 pub mod tasks;
 
 use axum::extract::State;
@@ -52,6 +53,8 @@ pub fn router<K: KernelPort>(state: Cos72State<K>) -> Router {
         .route("/tasks/{id}", get(tasks::get_task::<K>))
         .route("/tasks/{id}/claim", post(tasks::claim_task::<K>))
         .route("/tasks/{id}/submit", post(tasks::submit_task::<K>))
+        .route("/points", get(points::all_balances::<K>))
+        .route("/points/{member}", get(points::member_balance::<K>))
         .with_state(state)
 }
 

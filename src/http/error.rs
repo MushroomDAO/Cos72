@@ -12,15 +12,20 @@ use axum::Json;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
-/// The four T1.2.1-scope failure modes (docs/agent/spec.md「状态机」table +
-/// 「REST 路由」错误体). `submit`'s 503 `approval_unavailable` is T1.3.1 scope
-/// (advise is not wired up yet) and deliberately has no variant here.
+/// The T1.2.1-scope failure modes plus T1.3.1a's two advise-related ones
+/// (docs/agent/spec.md「状态机」table + 「REST 路由」错误体 + 「submit 的精确步
+/// 骤」第 1/3 步): `ApprovalUnavailable` (503 — `module.approval()` missing
+/// or the proxied request carries no `request_id`/`approval_token`) and
+/// `KernelError` (502 — any `advise` failure other than `ConnectionLost`/
+/// `NotSent`, docs/agent/spec.md「submit 的精确步骤」第 3 步: "带闭集 kind").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiError {
     InvalidRequest(String),
     NotFound,
     InvalidTransition,
     NotClaimer,
+    ApprovalUnavailable,
+    KernelError(String),
     /// A store (sqlx) failure — the detail string is logged by the caller
     /// (`http::tasks::store_error`) via `tracing::error!`, never echoed back
     /// to the client (`message()` below returns a fixed, generic string).
@@ -34,6 +39,8 @@ impl ApiError {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::InvalidTransition => StatusCode::CONFLICT,
             Self::NotClaimer => StatusCode::FORBIDDEN,
+            Self::ApprovalUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            Self::KernelError(_) => StatusCode::BAD_GATEWAY,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -44,6 +51,8 @@ impl ApiError {
             Self::NotFound => "not_found",
             Self::InvalidTransition => "invalid_transition",
             Self::NotClaimer => "not_claimer",
+            Self::ApprovalUnavailable => "approval_unavailable",
+            Self::KernelError(_) => "kernel_error",
             Self::Internal => "internal_error",
         }
     }
@@ -54,6 +63,10 @@ impl ApiError {
             Self::NotFound => "task not found".to_owned(),
             Self::InvalidTransition => "task is not in a state that allows this action".to_owned(),
             Self::NotClaimer => "only the member who claimed this task may submit it".to_owned(),
+            Self::ApprovalUnavailable => {
+                "the approval capability is unavailable for this request".to_owned()
+            }
+            Self::KernelError(msg) => msg.clone(),
             Self::Internal => "internal error".to_owned(),
         }
     }

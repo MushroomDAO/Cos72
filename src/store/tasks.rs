@@ -194,31 +194,56 @@ pub async fn claim_task(
     }
 }
 
-/// Outcome of a submit attempt.
+/// Outcome of a submit attempt (docs/agent/spec.md「submit 的精确步骤」第 2
+/// 步 — this is the store's view of that step; the HTTP handler decides
+/// whether/how to call `advise` from here).
 pub enum SubmitOutcome {
-    /// `claimed → submitted` happened; a fresh `awaiting` award (`approval_id
-    /// IS NULL`) now exists for this task (docs/agent/tasks.md T1.2.1「提交
-    /// 时只落本地 awaiting 奖励行」).
+    /// This call needs to (re-)advise for `award_id` — either because
+    /// `claimed → submitted` just happened (`emit_task_submitted = true`),
+    /// or because the task was already `submitted` and its current
+    /// `awaiting` award has `approval_id IS NULL` (孤儿补偿: a previous
+    /// advise never got its id written back) or no `awaiting` award exists
+    /// at all (the previous one `expired`) — both reuse/create scenarios
+    /// need a fresh `advise`, but must NOT re-emit `task.submitted` (the
+    /// task did not just transition).
     // Boxed for the same reason as `ClaimOutcome::Claimed`.
-    Submitted {
+    NeedsAdvise {
         task: Box<TaskRow>,
         award_id: String,
+        emit_task_submitted: bool,
+    },
+    /// The task was already `submitted` and its current `awaiting` award
+    /// already has an `approval_id` — idempotent re-entry, spec.md「submit
+    /// 的精确步骤」第 2 步: "不再 advise，直接 200 返回现状".
+    AlreadyAdvised {
+        task: Box<TaskRow>,
+        award_id: String,
+        approval_id: String,
     },
     NotFound,
-    /// The task exists but is not `claimed` (open/submitted/completed) — 409.
+    /// The task exists but is neither `claimed` nor `submitted` (open or
+    /// completed) — 409.
     InvalidTransition,
-    /// The task is `claimed`, but by someone else — 403 `not_claimer`.
+    /// The task is `claimed`/`submitted`, but by someone else — 403
+    /// `not_claimer`.
     NotClaimer,
 }
 
-/// docs/agent/spec.md「状态机」`claimed → submitted` — the read-decide-write
-/// happens inside one `BEGIN IMMEDIATE` transaction (docs/agent/architecture.
-/// md 核心判断 4 / 不可动摇的边界: transitions are one SQLite transaction),
-/// so no concurrent submit/claim can observe or produce a half-applied
-/// state. `BEGIN IMMEDIATE` (not the default `DEFERRED`) takes the write
-/// lock up front, before the `SELECT` that decides the outcome, so the
-/// decision and the write it leads to can never straddle a lock handoff to
-/// another writer.
+/// docs/agent/spec.md「状态机」`claimed → submitted`, plus the `submitted →
+/// submitted` re-entry cases (「submit 的精确步骤」第 2 步) — the
+/// read-decide-write happens inside one `BEGIN IMMEDIATE` transaction
+/// (docs/agent/architecture.md 核心判断 4 / 不可动摇的边界: transitions are
+/// one SQLite transaction), so no concurrent submit/claim/poller-credit can
+/// observe or produce a half-applied state. `BEGIN IMMEDIATE` (not the
+/// default `DEFERRED`) takes the write lock up front, before the `SELECT`
+/// that decides the outcome, so the decision and the write it leads to can
+/// never straddle a lock handoff to another writer.
+///
+/// `new_award_id` is only used when this call ends up inserting a fresh
+/// `awards` row (the `claimed → submitted` transition, or a `submitted`
+/// re-entry with no `awaiting` row left because the previous one expired) —
+/// the `submitted`-with-an-existing-`awaiting`-row cases reuse that row's
+/// own `award_id` instead and `new_award_id` goes unused.
 ///
 /// # Errors
 /// Any sqlx error (the transaction is rolled back before the error is
@@ -229,7 +254,7 @@ pub async fn submit_task(
     member: &str,
     evidence: Option<&str>,
     now: &str,
-    award_id: &str,
+    new_award_id: &str,
 ) -> Result<SubmitOutcome> {
     let mut conn = pool.acquire().await?;
     sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
@@ -239,10 +264,10 @@ pub async fn submit_task(
     // before propagating, instead of every early return above duplicating it.
     // `&mut conn` (a `PoolConnection<Sqlite>`) deref-coerces to `&mut
     // SqliteConnection` at this call site.
-    let outcome = submit_task_locked(&mut conn, task_id, member, evidence, now, award_id).await;
+    let outcome = submit_task_locked(&mut conn, task_id, member, evidence, now, new_award_id).await;
 
     match &outcome {
-        Ok(SubmitOutcome::Submitted { .. }) => {
+        Ok(SubmitOutcome::NeedsAdvise { .. } | SubmitOutcome::AlreadyAdvised { .. }) => {
             sqlx::query("COMMIT").execute(&mut *conn).await?;
         }
         _ => {
@@ -263,7 +288,7 @@ async fn submit_task_locked(
     member: &str,
     evidence: Option<&str>,
     now: &str,
-    award_id: &str,
+    new_award_id: &str,
 ) -> Result<SubmitOutcome> {
     let row = sqlx::query("SELECT status, claimer, reward_points FROM tasks WHERE task_id = ?")
         .bind(task_id)
@@ -277,22 +302,101 @@ async fn submit_task_locked(
     let claimer: Option<String> = row.try_get("claimer")?;
     let reward_points: i64 = row.try_get("reward_points")?;
 
-    if status != "claimed" {
+    if status != "claimed" && status != "submitted" {
         return Ok(SubmitOutcome::InvalidTransition);
     }
     if claimer.as_deref() != Some(member) {
         return Ok(SubmitOutcome::NotClaimer);
     }
 
-    sqlx::query(
-        "UPDATE tasks SET status = 'submitted', evidence = ?, updated_at = ? WHERE task_id = ?",
+    if status == "claimed" {
+        sqlx::query(
+            "UPDATE tasks SET status = 'submitted', evidence = ?, updated_at = ? WHERE task_id \
+             = ?",
+        )
+        .bind(evidence)
+        .bind(now)
+        .bind(task_id)
+        .execute(&mut *conn)
+        .await?;
+
+        insert_awaiting_award(
+            &mut *conn,
+            new_award_id,
+            task_id,
+            member,
+            reward_points,
+            now,
+        )
+        .await?;
+
+        let task = refetch_task(&mut *conn, task_id).await?;
+        return Ok(SubmitOutcome::NeedsAdvise {
+            task: Box::new(task),
+            award_id: new_award_id.to_owned(),
+            emit_task_submitted: true,
+        });
+    }
+
+    // `status == "submitted"`: spec.md「submit 的精确步骤」第 2 步, second
+    // bullet. The partial unique index `idx_awards_one_awaiting_per_task`
+    // guarantees at most one `awaiting` row for this task.
+    let awaiting = sqlx::query(
+        "SELECT award_id, approval_id FROM awards WHERE task_id = ? AND state = 'awaiting'",
     )
-    .bind(evidence)
-    .bind(now)
     .bind(task_id)
-    .execute(&mut *conn)
+    .fetch_optional(&mut *conn)
     .await?;
 
+    match awaiting {
+        Some(row) => {
+            let award_id: String = row.try_get("award_id")?;
+            let approval_id: Option<String> = row.try_get("approval_id")?;
+            let task = refetch_task(&mut *conn, task_id).await?;
+            match approval_id {
+                None => Ok(SubmitOutcome::NeedsAdvise {
+                    task: Box::new(task),
+                    award_id,
+                    emit_task_submitted: false,
+                }),
+                Some(approval_id) => Ok(SubmitOutcome::AlreadyAdvised {
+                    task: Box::new(task),
+                    award_id,
+                    approval_id,
+                }),
+            }
+        }
+        None => {
+            // The previous award for this task `expired` (or was `denied`,
+            // though `denied` sends the task back to `claimed` so it would
+            // not be `submitted` here) — insert a fresh one.
+            insert_awaiting_award(
+                &mut *conn,
+                new_award_id,
+                task_id,
+                member,
+                reward_points,
+                now,
+            )
+            .await?;
+            let task = refetch_task(&mut *conn, task_id).await?;
+            Ok(SubmitOutcome::NeedsAdvise {
+                task: Box::new(task),
+                award_id: new_award_id.to_owned(),
+                emit_task_submitted: false,
+            })
+        }
+    }
+}
+
+async fn insert_awaiting_award(
+    conn: &mut SqliteConnection,
+    award_id: &str,
+    task_id: &str,
+    member: &str,
+    points: i64,
+    now: &str,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO awards (award_id, task_id, member, points, approval_id, state, created_at) \
          VALUES (?, ?, ?, ?, NULL, 'awaiting', ?)",
@@ -300,18 +404,100 @@ async fn submit_task_locked(
     .bind(award_id)
     .bind(task_id)
     .bind(member)
-    .bind(reward_points)
+    .bind(points)
     .bind(now)
     .execute(&mut *conn)
     .await?;
+    Ok(())
+}
 
+async fn refetch_task(conn: &mut SqliteConnection, task_id: &str) -> Result<TaskRow> {
     let task = sqlx::query_as::<_, TaskRow>("SELECT * FROM tasks WHERE task_id = ?")
         .bind(task_id)
         .fetch_one(&mut *conn)
         .await?;
+    Ok(task)
+}
 
-    Ok(SubmitOutcome::Submitted {
-        task: Box::new(task),
-        award_id: award_id.to_owned(),
+/// docs/agent/spec.md「submit 的精确步骤」第 4 步: `UPDATE awards SET
+/// approval_id = ? WHERE award_id = ? AND state = 'awaiting' AND
+/// approval_id IS NULL` — a plain CAS via `rows_affected()`, no
+/// transaction of its own needed (a single `UPDATE` is already atomic).
+///
+/// # Errors
+/// Any sqlx error.
+pub enum CasApprovalOutcome {
+    /// This call's `approval_id` was written — it is now the award's
+    /// recorded approval, and this poll thread's future `status` calls will
+    /// use it.
+    Written,
+    /// 0 rows matched: the award moved on before this write landed.
+    /// `existing_approval_id` is `Some` when another writer's CAS already
+    /// occupied this row (docs/agent/spec.md「submit 的精确步骤」第 4 步:
+    /// "本次 advise 产生的审批成为孤儿" — this call's own `approval_id` is
+    /// simply never recorded anywhere and is therefore never credited);
+    /// `None` in the (very rare) case the award left `awaiting` entirely
+    /// between this call's `advise` and its CAS write (e.g. `expired` via
+    /// TTL) — that award's approval never gets an id recorded either, same
+    /// orphan outcome.
+    LostRace {
+        existing_approval_id: Option<String>,
+    },
+}
+
+pub async fn cas_write_approval_id(
+    pool: &SqlitePool,
+    award_id: &str,
+    approval_id: &str,
+) -> Result<CasApprovalOutcome> {
+    let result = sqlx::query(
+        "UPDATE awards SET approval_id = ? WHERE award_id = ? AND state = 'awaiting' AND \
+         approval_id IS NULL",
+    )
+    .bind(approval_id)
+    .bind(award_id)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 1 {
+        return Ok(CasApprovalOutcome::Written);
+    }
+    let existing: Option<Option<String>> =
+        sqlx::query_scalar("SELECT approval_id FROM awards WHERE award_id = ?")
+            .bind(award_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(CasApprovalOutcome::LostRace {
+        existing_approval_id: existing.flatten(),
     })
+}
+
+/// docs/agent/spec.md「入账」: every `awaiting` award with an `approval_id`
+/// already recorded — the award_poller's own work queue. Order is
+/// unspecified but stable-ish (`rowid`) so tests can reason about it.
+///
+/// # Errors
+/// Any sqlx error.
+pub async fn list_awards_pending_poll(pool: &SqlitePool) -> Result<Vec<AwardRow>> {
+    let rows = sqlx::query_as::<_, AwardRow>(
+        "SELECT award_id, task_id, member, points, approval_id, state FROM awards WHERE state = \
+         'awaiting' AND approval_id IS NOT NULL ORDER BY rowid ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// docs/agent/spec.md「入账」错误处理: a retryable/unclassified `status`
+/// error just records `last_poll_error` for observability — the row stays
+/// `awaiting`, the next tick tries again.
+///
+/// # Errors
+/// Any sqlx error.
+pub async fn record_poll_error(pool: &SqlitePool, award_id: &str, message: &str) -> Result<()> {
+    sqlx::query("UPDATE awards SET last_poll_error = ? WHERE award_id = ?")
+        .bind(message)
+        .bind(award_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
