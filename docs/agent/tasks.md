@@ -28,12 +28,12 @@
 
 | Cos72 Task | Agent24 ID | 依赖（跨仓库） | 状态 |
 |:---|:---|:---|:---|
-| T1.0.1 | ME4-5.3.1 | ME4-5.1.2b（tag `agent24-os-sdk-v0.1.0` 已存在） | `IN_PROGRESS` |
-| T1.1.1 | ME4-5.3.2 | T1.0.1 | `BACKLOG` |
-| T1.2.1 | ME4-5.3.3a | T1.1.1 | `BACKLOG` |
-| T1.3.1 | ME4-5.3.3b | T1.2.1 | `BACKLOG` |
-| T1.4.1 | ME4-5.3.4 | T1.3.1 + ME4-5.2.1（Sin90 迁到 SDK） | `BACKLOG` |
-| T2.1.1 | ME4-6.0.2（Cos72 部分） | T1.4.1 + ME4-6.0.1（发布清单冻结） | `IN_PROGRESS` |
+| T1.0.1 | ME4-5.3.1 | ME4-5.1.2b（tag `agent24-os-sdk-v0.1.0` 已存在） | `DONE`（#3） |
+| T1.1.1 | ME4-5.3.2 | T1.0.1 | `DONE`（#4） |
+| T1.2.1 | ME4-5.3.3a | T1.1.1 | `DONE`（#5） |
+| T1.3.1 | ME4-5.3.3b | T1.2.1 | `DONE`（#6、#7） |
+| T1.4.1 | ME4-5.3.4 | T1.3.1 + ME4-5.2.1（Sin90 迁到 SDK） | `DONE`（#8） |
+| T2.1.1 | ME4-6.0.2（Cos72 部分） | T1.4.1 + ME4-6.0.1（发布清单冻结） | `DONE`（#9 + Release v0.1.0） |
 
 **需 jason 手动做（不是 goal task）**：① 给 `MushroomDAO/Cos72` main 开 ruleset（1 个审批 + dismiss stale）；② 确认 PR-Daemon（clestons）监听 `MushroomDAO/Cos72`（开放问题 Q7）。
 
@@ -41,7 +41,7 @@
 
 ## F1.0 — 规划层
 
-### T1.0.1 pilot 七件套 + `.pilot.yml`（ME4-5.3.1）  `IN_PROGRESS`
+### T1.0.1 pilot 七件套 + `.pilot.yml`（ME4-5.3.1）  `DONE`
 - **优先级**：high
 - **目标**：Cos72 有可无人值守执行的规划层；5.3.2–5.3.4 的 task、验收、PR 规模、开放问题全部落在本仓库。
 - **开发范围**：`.pilot.yml`、`docs/agent/{research,acceptance,architecture,spec,roadmap,tasks,progress}.md`。
@@ -57,7 +57,7 @@
 
 ## F1.1 — 骨架
 
-### T1.1.1 Cargo 工程 + manifest + SDK 挂载 + 迁移 + 事件 + CI（ME4-5.3.2）  `BACKLOG`
+### T1.1.1 Cargo 工程 + manifest + SDK 挂载 + 迁移 + 事件 + CI（ME4-5.3.2）  `DONE`
 - **优先级**：high
 - **目标**：一个能被真实 agent24d 装上、握手成功、挂载 `/api/v1/cos72/health`、发出 `module.ready` 事件的空壳，库里已有 spec.md 的全量 schema。
 - **开发范围**：
@@ -91,7 +91,7 @@
 
 ## F1.2 — mytask 实体与路由
 
-### T1.2.1 任务状态机 + 发布/领取/提交/查询路由 + 事件（ME4-5.3.3a）  `BACKLOG`
+### T1.2.1 任务状态机 + 发布/领取/提交/查询路由 + 事件（ME4-5.3.3a）  `DONE`
 - **优先级**：high
 - **目标**：mytask 从 `open` 走到 `submitted`；提交时**只落本地** `awaiting` 奖励行（`approval_id IS NULL`，即 ME4-S3 §2.10「先落本地」那半步），advise 在 T1.3.1 接上。
 - **开发范围**：`src/core/task.rs`（纯状态机 + 校验）、`src/store/tasks.rs`、`src/http/tasks.rs`（spec.md 路由表的 `POST /tasks`、`GET /tasks`、`GET /tasks/{id}`、`POST …/claim`、`POST …/submit`）、事件 `task.published / task.claimed / task.submitted`、统一错误体。
@@ -113,7 +113,7 @@
 
 ## F1.3 — 审批发积分 + 账本 + 记忆
 
-### T1.3.1 submit 内 advise + status 轮询入账 + 追加式账本 + outbox 串行 remember_once（ME4-5.3.3b）  `BACKLOG`
+### T1.3.1 submit 内 advise + status 轮询入账 + 追加式账本 + outbox 串行 remember_once（ME4-5.3.3b）  `DONE`
 - **优先级**：high
 - **目标**：批准才入账、每笔奖励至多入账一次、孤儿只会少发；余额 = 账本回放；完成摘要经 outbox 单泵恰好一次进内核记忆。
 - **开发范围**：
@@ -151,7 +151,7 @@
 
 ## F1.4 — 真实挂载黑盒
 
-### T1.4.1 全流程黑盒 + 与 Sin90 共存隔离（ME4-5.3.4）  `BACKLOG`
+### T1.4.1 全流程黑盒 + 与 Sin90 共存隔离（ME4-5.3.4）  `DONE`
 - **优先级**：high
 - **目标**：只用真实 agent24d + 真实 cos72 + 真实 sin90 二进制，证明「安装 → 挂载 → 全流程 → 审批往返 → 两模块同时挂载时互相读不到对方的记忆与 schedules」。
 - **开发范围**：`tests/agent24_mount_blackbox.rs` 增加 `cos72_full_flow_real_mount` 与 `cos72_and_sin90_coexist_isolated`；夹具增加从 `SIN90_CHECKOUT` 以 `test-hooks` 构建 sin90（独立 `--target-dir`）并装包。
@@ -174,7 +174,7 @@
 
 ## F2.1 — 打包与 Release（M2）
 
-### T2.1.1 可安装包 + SHA256SUMS + GitHub Release（ME4-6.0.2 的 Cos72 部分）  `IN_PROGRESS`
+### T2.1.1 可安装包 + SHA256SUMS + GitHub Release（ME4-6.0.2 的 Cos72 部分）  `DONE`
 - **优先级**：mid
 - **目标**：按 ME4-6.0.1 冻结的清单产出 Cos72 发布物。
 - **依赖**：T1.4.1、ME4-6.0.1
@@ -188,6 +188,7 @@
      （脚本末尾已内置此检查）。
   4. `tar -tvzf dist/cos72-<ver>-macos-arm64.tar.gz | grep bin/cos72` 权限位含 `x`
      （二进制可执行）。
+- **证据（2026-09-30）**：#9 合并于 39a05d8；从 main 构建发布 [v0.1.0](https://github.com/MushroomDAO/Cos72/releases/tag/v0.1.0)，`cos72-0.1.0-macos-arm64.tar.gz` sha256 `148547ddf072e2e85fdb9d3eadaeb349755eff9db280f4b9cf283bf12e67e6bc`；Agent24 ME4-6.1.3 在 Mac mini 干净机器只用 Release 资产安装，`agent24 os list` 显示 `cos72 0.1.0 [mounted]`。
   5. GitHub Release 部分（上传 tarball + SHA256SUMS 到 `MushroomDAO/Cos72` Release）
      待 ME4-6.0.1 清单正式冻结后再做 —— 本片只做本地打包脚本 + 本地验证，不 push/开
      PR/打 tag/发 Release。
