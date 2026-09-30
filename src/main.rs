@@ -25,16 +25,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let store = Cos72Store::open(&module.data_dir().join("cos72.db")).await?;
 
-    let kernel = SdkKernelPort::wire(&module);
+    let kernel = Arc::new(SdkKernelPort::wire(&module));
     // docs/agent/spec.md「事件」: "启动握手成功后发一次 module.ready（黑盒可
     // 观测的起点）" — after the handshake and the store are both up.
     kernel.emit("module.ready", serde_json::Map::new());
+
+    // docs/agent/architecture.md 不可动摇的边界 #6: only spawn the poller
+    // when the kernel actually granted `approval` — a generation without it
+    // has nothing for the poller to do (every submit already answers 503
+    // and writes no `awaiting` row for it to find).
+    if kernel.approval_available() {
+        // The `JoinHandle` outlives nothing this process cares about — the
+        // task itself only stops via `TickControl::Stop`/a store error loop
+        // exit, at which point the SDK's own fatal hook has already (or is
+        // about to) `exit(70)` this generation.
+        drop(cos72::workers::award_poller::spawn_loop(
+            store.clone(),
+            kernel.clone(),
+        ));
+    }
 
     let capabilities = Arc::new(module.offer().provides.clone());
     let app = router(Cos72State {
         capabilities,
         store,
-        kernel: Arc::new(kernel),
+        kernel,
     });
     module.serve(app).await?;
     Ok(())

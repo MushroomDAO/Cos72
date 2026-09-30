@@ -429,6 +429,272 @@ fn cos72_mounts_and_answers_health() {
     );
 }
 
+/// Wait (up to `secs`) for `GET path` through the real proxy to return the
+/// given status, retrying on connection hiccups the same way every other
+/// polling loop in this file does; returns the parsed JSON body.
+fn wait_for_get(d: &Daemon, path: &str, want_status: u16, secs: u64) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some((status, body)) = http_get(d.port, Some(&d.token), path) {
+            if status == want_status {
+                return serde_json::from_str(&body)
+                    .unwrap_or_else(|e| panic!("GET {path} returned non-JSON body {body:?}: {e}"));
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "GET {path} never returned {want_status} (last: {status} {body}); daemon \
+                     log:\n{}",
+                    d.combined_log()
+                );
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "GET {path} got no response before the deadline; daemon log:\n{}",
+            d.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// docs/agent/tasks.md T1.3.1 验收命令 #6 (T1.3.1a slice — the points half;
+/// T1.3.1b adds the memory-recall assertions on top of this same scenario):
+/// a real `agent24d` + real `cos72`, submit → the kernel's own
+/// `/api/v1/module-approvals` shows a `module=cos72`, `kind=advise` row whose
+/// `payload.award_id` matches the submitted award → approving it credits the
+/// ledger within the poller's own interval → `GET /points/{member}` equals
+/// the reward → a SECOND task's award, denied instead, returns its task to
+/// `claimed` and does NOT move the balance (正对照) → restarting the daemon
+/// (a fresh generation, fresh poller) leaves the balance unchanged (pure
+/// ledger replay, nothing cached in memory).
+#[test]
+#[ignore = "needs a sibling Agent24 checkout; run explicitly: cargo test --test agent24_mount_blackbox -- --ignored --test-threads=1"]
+fn cos72_award_roundtrip_under_real_daemon() {
+    let checkout = agent24_checkout().unwrap_or_else(|| {
+        panic!(
+            "no Agent24 checkout found (set AGENT24_CHECKOUT or place it at ../Agent24) — this \
+             test must FAIL, not silently skip, when its prerequisite is missing"
+        )
+    });
+    let agent24d_bin = build_agent24d(&checkout);
+    let cos72_bin = PathBuf::from(env!("CARGO_BIN_EXE_cos72"));
+
+    let home = tmp_home("award-roundtrip");
+    install_cos72(&home.join(".agent24/packages"), &cos72_bin);
+
+    let daemon = start_daemon(&home, &agent24d_bin);
+
+    let ready_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some((200, _)) = http_get(daemon.port, Some(&daemon.token), "/api/v1/cos72/health") {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "cos72 never answered /health through the real proxy; daemon log:\n{}",
+            daemon.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // ---- Path 1: approved → credited ----
+    let publish_body =
+        serde_json::json!({"title": "approved task", "reward_points": 7, "publisher": "pub1"});
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        "/api/v1/cos72/tasks",
+        &publish_body,
+    )
+    .unwrap();
+    assert_eq!(
+        status,
+        201,
+        "daemon log:\n{}\nbody: {body}",
+        daemon.combined_log()
+    );
+    let task: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let task_id = task["task_id"].as_str().unwrap().to_owned();
+
+    let (status, _) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        &format!("/api/v1/cos72/tasks/{task_id}/claim"),
+        &serde_json::json!({"member": "mem1"}),
+    )
+    .unwrap();
+    assert_eq!(status, 200, "daemon log:\n{}", daemon.combined_log());
+
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        &format!("/api/v1/cos72/tasks/{task_id}/submit"),
+        &serde_json::json!({"member": "mem1"}),
+    )
+    .unwrap();
+    assert_eq!(
+        status,
+        202,
+        "daemon log:\n{}\nbody: {body}",
+        daemon.combined_log()
+    );
+    let submitted: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let award_id = submitted["award"]["award_id"].as_str().unwrap().to_owned();
+    assert!(
+        submitted["award"]["approval_id"].is_string(),
+        "a real advise must have returned a real approval_id: {submitted}"
+    );
+
+    // Find the pending module-approval the real kernel recorded for this
+    // award — proves advise really reached the kernel's own approval store,
+    // not just a mock.
+    let pending = wait_for_get(
+        &daemon,
+        "/api/v1/module-approvals?decision=pending",
+        200,
+        10,
+    );
+    let approval = pending["module_approvals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["module"] == "cos72" && a["payload"]["award_id"] == award_id)
+        .unwrap_or_else(|| panic!("no pending module-approval for award {award_id}: {pending}"));
+    assert_eq!(approval["kind"], "advise", "{approval}");
+    let approval_id = approval["id"].as_str().unwrap().to_owned();
+
+    let decide_body = serde_json::json!({"decision": "approved"});
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        &format!("/api/v1/module-approvals/{approval_id}"),
+        &decide_body,
+    )
+    .unwrap();
+    assert_eq!(
+        status,
+        200,
+        "daemon log:\n{}\nbody: {body}",
+        daemon.combined_log()
+    );
+
+    // The poller ticks every 3s (docs/agent/spec.md「入账」) — give it up to
+    // 30s of margin under test/CI load.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let task = wait_for_get(&daemon, &format!("/api/v1/cos72/tasks/{task_id}"), 200, 5);
+        if task["status"] == "completed" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task {task_id} never reached completed after approval; last: {task}; daemon \
+             log:\n{}",
+            daemon.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let points = wait_for_get(&daemon, "/api/v1/cos72/points/mem1", 200, 5);
+    assert_eq!(points["balance"], 7, "{points}");
+
+    // ---- Path 2 (正对照): denied → back to claimed, balance unchanged ----
+    let publish_body2 =
+        serde_json::json!({"title": "denied task", "reward_points": 99, "publisher": "pub1"});
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        "/api/v1/cos72/tasks",
+        &publish_body2,
+    )
+    .unwrap();
+    assert_eq!(status, 201, "{body}");
+    let task2: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let task2_id = task2["task_id"].as_str().unwrap().to_owned();
+    http_post(
+        daemon.port,
+        Some(&daemon.token),
+        &format!("/api/v1/cos72/tasks/{task2_id}/claim"),
+        &serde_json::json!({"member": "mem2"}),
+    )
+    .unwrap();
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        &format!("/api/v1/cos72/tasks/{task2_id}/submit"),
+        &serde_json::json!({"member": "mem2"}),
+    )
+    .unwrap();
+    assert_eq!(status, 202, "{body}");
+    let submitted2: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let award2_id = submitted2["award"]["award_id"].as_str().unwrap().to_owned();
+
+    let pending2 = wait_for_get(
+        &daemon,
+        "/api/v1/module-approvals?decision=pending",
+        200,
+        10,
+    );
+    let approval2 = pending2["module_approvals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["module"] == "cos72" && a["payload"]["award_id"] == award2_id)
+        .unwrap_or_else(|| panic!("no pending module-approval for award {award2_id}: {pending2}"));
+    let approval2_id = approval2["id"].as_str().unwrap().to_owned();
+    let (status, body) = http_post(
+        daemon.port,
+        Some(&daemon.token),
+        &format!("/api/v1/module-approvals/{approval2_id}"),
+        &serde_json::json!({"decision": "denied"}),
+    )
+    .unwrap();
+    assert_eq!(status, 200, "{body}");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let task2 = wait_for_get(&daemon, &format!("/api/v1/cos72/tasks/{task2_id}"), 200, 5);
+        if task2["status"] == "claimed" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "task {task2_id} never returned to claimed after denial; last: {task2}; daemon \
+             log:\n{}",
+            daemon.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let points_after_deny = wait_for_get(&daemon, "/api/v1/cos72/points/mem1", 200, 5);
+    assert_eq!(
+        points_after_deny["balance"], 7,
+        "a denied award must never move any balance: {points_after_deny}"
+    );
+    let points_mem2 = wait_for_get(&daemon, "/api/v1/cos72/points/mem2", 200, 5);
+    assert_eq!(points_mem2["balance"], 0, "{points_mem2}");
+
+    // ---- Restart: balance survives (pure ledger replay) ----
+    drop(daemon);
+    let daemon2 = start_daemon(&home, &agent24d_bin);
+    let ready_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some((200, _)) = http_get(daemon2.port, Some(&daemon2.token), "/api/v1/cos72/health")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "cos72 never answered /health after restart; daemon log:\n{}",
+            daemon2.combined_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let points_restarted = wait_for_get(&daemon2, "/api/v1/cos72/points/mem1", 200, 10);
+    assert_eq!(
+        points_restarted["balance"], 7,
+        "balance must survive a restart unchanged: {points_restarted}"
+    );
+}
+
 /// docs/agent/tasks.md T1.2.1 验收命令 #4: a real `agent24d` + real `cos72`,
 /// publish → claim → submit through the real proxy, `GET /tasks/{id}` ends up
 /// `submitted`, and the WS boundary observes `task.published`, `task.claimed`,

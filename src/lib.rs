@@ -17,6 +17,7 @@ pub mod core;
 pub mod http;
 pub mod kernel;
 pub mod store;
+pub mod workers;
 
 /// The manifest bytes sent to the kernel at `initialize` — the SAME bytes
 /// `tests/manifest.rs::binary_embeds_the_same_manifest_bytes` compares

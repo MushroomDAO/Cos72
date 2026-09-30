@@ -8,6 +8,7 @@ use sqlx::SqlitePool;
 use std::path::Path;
 use std::str::FromStr;
 
+pub mod ledger;
 pub mod tasks;
 
 #[derive(Debug, thiserror::Error)]
