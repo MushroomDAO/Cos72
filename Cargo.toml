@@ -1,0 +1,61 @@
+[package]
+name = "cos72"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Cos72 — 社区任务与积分领域 OS，跑在 Agent24 内核之上（ME4-5.3 原型）"
+repository = "https://github.com/MushroomDAO/Cos72"
+
+[[bin]]
+name = "cos72"
+path = "src/main.rs"
+
+[lib]
+name = "cos72"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+axum = { version = "0.8", features = ["json"] }
+tower = "0.5"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ulid = "1"
+# ME4-5.3.2 (docs/agent/architecture.md 核心判断 1): the out-of-process
+# module SDK. Pinned by tag, not branch, same reasoning as Sin90's
+# Cargo.toml (docs/agent/architecture.md 核心判断 1 第三点): builds are
+# reproducible independent of Agent24's own main branch history; bumping
+# this tag is its own, separate commit.
+agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.1.0" }
+
+[features]
+# T1.1.1 (docs/agent/architecture.md 不可动摇的边界 #9): gates `/debug/*`
+# routes (added from T1.3.1 onward) — off in every real package build, same
+# posture as Sin90's own `test-hooks`.
+test-hooks = []
+
+[dev-dependencies]
+# Forwards the SDK's own `test-util` feature (proto's in-memory fake kernel,
+# `module::testing`, re-exported as `agent24_os_sdk::testing`) — this crate's
+# dev-dependencies only ever need to name the SDK, not `agent24-os-proto`
+# directly (mirrors Sin90's Cargo.toml, same tag so Cargo resolves one copy
+# of `agent24-os-proto` in the dependency graph).
+agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.1.0", features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+# Test-only: tests/manifest.rs reads domain-os.yml's own fields (docs/agent/
+# tasks.md T1.1.1 验收命令 #1) — same version agent24-os-proto's own
+# `manifest::facts_from_yaml` uses at this SDK tag, so both readings agree.
+serde_yaml = "0.9"
+# Test-only (tests/agent24_mount_blackbox.rs, `#[ignore]`d, never in CI):
+# graceful-terminate-then-kill of the spawned `agent24d` child (mirrors
+# Sin90's own blackbox harness, same justification — a plain `Child` drop
+# does not terminate the OS process).
+rustix = { version = "0.38", features = ["process"] }
+# Test-only: the real-mount WS subscriber that observes `module.ready`.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }

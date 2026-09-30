@@ -1,0 +1,25 @@
+# Cos72 的领域 OS 清单（docs/agent/spec.md「manifest」，逐字冻结）。
+#
+# `name` 是身份的唯一来源 —— route_namespace / event_module / data_dir 都由它派生；
+# 内核 `agent24-domain` 安装时会校验这三者与 `name` 逐字相等（tests/manifest.rs 的
+# `manifest_fields_derive_from_name` 在本仓库自己的 CI 里先钉一遍）。
+name: cos72
+version: "0.1.0"
+route_namespace: /api/v1/cos72
+event_module: cos72
+data_dir: ~/.agent24/os/cos72/
+
+requires_models: []
+requires_apis: []
+requires_deps: []
+
+# 只写真正用到的三个（docs/agent/architecture.md 核心判断 3）：
+# events（每个动作发事件）、memory（完成摘要写内核私有记忆）、approval（发积分经内核
+# 人工审批，advise）。不要 scheduler（轮询在模块自己的 outbox/泵里，不是内核 cron）；
+# 不要 models（原型没有推理需求）。
+kernel_capabilities: [events, memory, approval]
+
+impl_kind: out_of_process_provider
+spawn:
+  command: bin/cos72
+  args: ["module"]
