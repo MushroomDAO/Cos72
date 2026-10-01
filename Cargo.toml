@@ -1,6 +1,6 @@
 [package]
 name = "cos72"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Cos72 — 社区任务与积分领域 OS，跑在 Agent24 内核之上（ME4-5.3 原型）"
