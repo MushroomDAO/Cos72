@@ -1,0 +1,168 @@
+name: Release
+
+# DEP-A4（Agent24 docs/Deployment/TASKS.md）：Cos72 多平台发布包，布局/命名/自检
+# 全部沿用 Agent24 DEP-A3 的 release.yml（手写流水线，cargo-dist 已推迟，见 Agent24
+# docs/Deployment/RESEARCH.md §3.1）。只在真正的 `vX.Y.Z` tag 上发布；pull_request
+# 触发时只构建 + 自检，绝不创建 Release。
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'true: 只构建并上传 artifact，不创建 GitHub Release'
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/package.sh'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            os: macos
+            arch: arm64
+          - target: x86_64-apple-darwin
+            # `macos-13`（最后一个纯 Intel runner）已下线。当前标准（免费分钟数）
+            # Intel macOS runner，见
+            # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+            # （2026-10-01 查证）："macOS, 4 CPU, Intel -> macos-15-intel,
+            # macos-26-intel"。选非 "-latest" 的 `macos-15-intel`，避免标签在
+            # 未来悄悄挪走。
+            runner: macos-15-intel
+            os: macos
+            arch: x64
+          - target: x86_64-unknown-linux-gnu
+            # ubuntu-22.04 的 glibc 基线更低。注意：GitHub 已于 2026-09-17 让该
+            # 镜像进入弃用 brownout，2027-04-17 下线 —— 到期前需要迁移（例如
+            # ubuntu-24.04，或 glibc 固定方案）。
+            runner: ubuntu-22.04
+            os: linux
+            arch: x64
+          - target: aarch64-unknown-linux-gnu
+            # 当前标准 arm64 Linux runner（同一文档页，2026-10-01 查证）："Linux,
+            # arm64 -> ubuntu-24.04-arm, ubuntu-22.04-arm, ubuntu-26.04-arm"。
+            # 用 22.04 与 x64 job 的 glibc 基线保持一致。
+            runner: ubuntu-22.04-arm
+            os: linux
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dryrun" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check tag matches crate version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_VER="${{ steps.ver.outputs.version }}"
+          CRATE_VER="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          echo "Cargo.toml: $CRATE_VER (tag: $TAG_VER)"
+          if [ "$CRATE_VER" != "$TAG_VER" ]; then
+            echo "::error::tag v$TAG_VER does not match Cargo.toml version $CRATE_VER"
+            exit 1
+          fi
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Rustup add target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Package (build + self-check + tar + shasum)
+        run: bash scripts/package.sh --target ${{ matrix.target }}
+
+      - name: Resolve package name
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          # dry-run（非 tag）场景下 scripts/package.sh 仍然用 Cargo.toml 里的真实
+          # version 命名产物（它不读 ref），这里只用于定位刚才生成的文件，不依赖
+          # steps.ver 的 dry-run 占位版本号。
+          CRATE_VER="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          NAME="cos72-${CRATE_VER}-${{ matrix.os }}-${{ matrix.arch }}"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "archive=dist/$NAME.tar.gz" >> "$GITHUB_OUTPUT"
+          test -f "dist/$NAME.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Collect + Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -la
+          shasum -a 256 -- *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+
+      # 显式按 event_name 判断，不用 `inputs.dry_run != true` 这类写法——pull_request
+      # 触发时 inputs.dry_run 是 null，Actions 的宽松相等比较会把 null 与 false/true
+      # 都转成数字 0 比较，`null != true` 会被判定为真，等于让 PR 也能触发发布。这里
+      # 用 event_name 显式排除，tag push 与 dispatch+dry_run=false 两条路径互不依赖
+      # 类型转换规则。
+      - name: Create Release
+        if: ${{ (github.event_name == 'push' && github.ref_type == 'tag') || (github.event_name == 'workflow_dispatch' && inputs.dry_run == false) }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "Cos72 $TAG" \
+            --notes "占位：正式发布说明在发布时人工补充。" \
+            dist/*.tar.gz dist/SHA256SUMS
