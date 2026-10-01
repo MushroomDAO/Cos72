@@ -4,7 +4,7 @@
 # 内核 `agent24-domain` 安装时会校验这三者与 `name` 逐字相等（tests/manifest.rs 的
 # `manifest_fields_derive_from_name` 在本仓库自己的 CI 里先钉一遍）。
 name: cos72
-version: "0.1.0"
+version: "0.1.1"
 route_namespace: /api/v1/cos72
 event_module: cos72
 data_dir: ~/.agent24/os/cos72/
