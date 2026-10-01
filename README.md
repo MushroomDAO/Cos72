@@ -47,16 +47,30 @@ commands expect, without paying for a real mount).
 
 ## 安装发布包
 
-从 Release 下载 `cos72-<版本>-macos-arm64.tar.gz` 和 `SHA256SUMS`，放在同一目录：
+发布包覆盖四个平台，按自己的系统 + 架构选择对应文件名（`<os>` 是
+`macos`/`linux`，`<arch>` 是 `arm64`/`x64`）：
+
+| 平台 | 包名 |
+|---|---|
+| macOS Apple Silicon | `cos72-<版本>-macos-arm64.tar.gz` |
+| macOS Intel | `cos72-<版本>-macos-x64.tar.gz` |
+| Linux x86_64 | `cos72-<版本>-linux-x64.tar.gz` |
+| Linux arm64 | `cos72-<版本>-linux-arm64.tar.gz` |
+
+从 Release 下载对应包和 `SHA256SUMS`，放在同一目录：
 
 ```sh
 shasum -a 256 -c SHA256SUMS
-tar -xzf cos72-<版本>-macos-arm64.tar.gz
-agent24 os install cos72-<版本>-macos-arm64/
+tar -xzf cos72-<版本>-<os>-<arch>.tar.gz
+agent24 os install cos72-<版本>-<os>-<arch>/
 ```
 
 （发布包由 `scripts/package.sh` 产出：解包后的目录里只有 `domain-os.yml` 和
-`bin/cos72` 两个文件 —— migrations 在编译期已经嵌进了二进制。）
+`bin/cos72` 两个文件 —— migrations 在编译期已经嵌进了二进制。本地打包时用
+`--target <triple>` 指定目标三元组，支持 `aarch64-apple-darwin` /
+`x86_64-apple-darwin` / `x86_64-unknown-linux-gnu` /
+`aarch64-unknown-linux-gnu`；不传则默认本机平台。CI 中四个目标各自在原生
+runner 上构建，见 `.github/workflows/release.yml`。）
 
 ## License
 

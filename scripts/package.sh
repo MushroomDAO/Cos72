@@ -1,24 +1,79 @@
 #!/usr/bin/env bash
-# Cos72 发布打包脚本（T2.1.1 / Agent24 ME4-6.0.2 的 Cos72 部分，docs/agent/tasks.md）。
+# Cos72 发布打包脚本（T2.1.1 / Agent24 ME4-6.0.2 的 Cos72 部分，docs/agent/tasks.md；
+# 多平台支持见 Agent24 docs/Deployment/TASKS.md DEP-A4）。
 #
 # 产出：
-#   dist/cos72-<ver>-macos-arm64.tar.gz  —— 解包后顶层目录里恰好只有
+#   dist/cos72-<ver>-<os>-<arch>.tar.gz  —— 解包后顶层目录里恰好只有
 #     domain-os.yml（仓库根目录那份）和 bin/cos72（release 二进制，可执行）。
 #   dist/SHA256SUMS                      —— 在 dist/ 内对 tarball 跑
 #     `shasum -a 256`，文件名写相对路径。
 #
-# 只在 Darwin arm64 上跑（目前只签发这一个平台的发布物）。
+# 支持 --target <triple> 指定构建目标，取值限定在下面四个（与 Agent24
+# release.yml / DEP-A4 验收一致）：
+#   aarch64-apple-darwin        -> macos-arm64
+#   x86_64-apple-darwin         -> macos-x64
+#   x86_64-unknown-linux-gnu    -> linux-x64
+#   aarch64-unknown-linux-gnu   -> linux-arm64
+# 不传 --target 时，默认取本机 `rustc -vV` 报告的 host triple（必须也在上面
+# 四个之内，否则报错退出）——这是本脚本设计上只在"原生 runner 构建原生目标"
+# 场景下使用，不做交叉编译；跨平台构建请在对应 target 的原生 runner 上跑本脚本。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-uname_sm="$(uname -sm)"
-if [[ "$uname_sm" != "Darwin arm64" ]]; then
-  echo "error: scripts/package.sh only runs on Darwin arm64 (got: $uname_sm)" >&2
-  exit 1
+TARGET=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target)
+      TARGET="${2:-}"
+      shift 2
+      ;;
+    --target=*)
+      TARGET="${1#--target=}"
+      shift
+      ;;
+    *)
+      echo "error: 未知参数：$1" >&2
+      echo "usage: $0 [--target <triple>]" >&2
+      exit 1
+      ;;
+  esac
+done
+
+if [[ -z "$TARGET" ]]; then
+  TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+  if [[ -z "$TARGET" ]]; then
+    echo "error: 未传 --target，且无法从 \`rustc -vV\` 探测到 host triple" >&2
+    exit 1
+  fi
+  echo "==> 未传 --target，使用本机 host triple：$TARGET"
 fi
+
+case "$TARGET" in
+  aarch64-apple-darwin)
+    PKG_OS="macos"
+    PKG_ARCH="arm64"
+    ;;
+  x86_64-apple-darwin)
+    PKG_OS="macos"
+    PKG_ARCH="x64"
+    ;;
+  x86_64-unknown-linux-gnu)
+    PKG_OS="linux"
+    PKG_ARCH="x64"
+    ;;
+  aarch64-unknown-linux-gnu)
+    PKG_OS="linux"
+    PKG_ARCH="arm64"
+    ;;
+  *)
+    echo "error: 不支持的 --target：$TARGET" >&2
+    echo "       仅支持：aarch64-apple-darwin / x86_64-apple-darwin / x86_64-unknown-linux-gnu / aarch64-unknown-linux-gnu" >&2
+    exit 1
+    ;;
+esac
 
 # --- migrations 是否编译进了二进制？ ---
 # src/store/mod.rs 用的是 `sqlx::migrate!("./migrations")` —— sqlx 的编译期宏，会把
@@ -45,12 +100,12 @@ if [[ -z "${VERSION:-}" ]]; then
   exit 1
 fi
 
-echo "==> packaging cos72 v${VERSION} for macos-arm64"
+echo "==> packaging cos72 v${VERSION} for ${PKG_OS}-${PKG_ARCH} (target: ${TARGET})"
 
-echo "==> cargo build --release"
-cargo build --release
+echo "==> cargo build --release --target ${TARGET}"
+cargo build --release --target "$TARGET"
 
-BIN="target/release/cos72"
+BIN="target/${TARGET}/release/cos72"
 if [[ ! -x "$BIN" ]]; then
   echo "error: 期望的 release 二进制 $BIN 不存在或不可执行" >&2
   exit 1
@@ -61,7 +116,27 @@ if [[ ! -f "domain-os.yml" ]]; then
   exit 1
 fi
 
-PKG_NAME="cos72-${VERSION}-macos-arm64"
+echo "==> self-check: 二进制架构"
+case "$PKG_OS" in
+  macos)
+    archs="$(lipo -archs "$BIN")"
+    echo "    lipo -archs: $archs"
+    case "$PKG_ARCH" in
+      arm64) echo "$archs" | grep -qw arm64 || { echo "error: $BIN 不含 arm64 架构（lipo -archs: $archs）" >&2; exit 1; } ;;
+      x64)   echo "$archs" | grep -qw x86_64 || { echo "error: $BIN 不含 x86_64 架构（lipo -archs: $archs）" >&2; exit 1; } ;;
+    esac
+    ;;
+  linux)
+    file_out="$(file "$BIN")"
+    echo "    file: $file_out"
+    case "$PKG_ARCH" in
+      arm64) echo "$file_out" | grep -qi "aarch64" || { echo "error: $BIN 不是 aarch64 架构（file: $file_out）" >&2; exit 1; } ;;
+      x64)   echo "$file_out" | grep -Eqi "x86-64|x86_64" || { echo "error: $BIN 不是 x86_64 架构（file: $file_out）" >&2; exit 1; } ;;
+    esac
+    ;;
+esac
+
+PKG_NAME="cos72-${VERSION}-${PKG_OS}-${PKG_ARCH}"
 DIST_DIR="dist"
 STAGE_DIR="${DIST_DIR}/${PKG_NAME}"
 TARBALL="${PKG_NAME}.tar.gz"
