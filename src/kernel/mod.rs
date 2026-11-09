@@ -502,7 +502,7 @@ mod tests {
     /// docs/agent/tasks.md T1.1.1 验收命令 #3, first case: the handshake
     /// this crate's own `main.rs` will run sends EXACTLY the manifest's
     /// `kernel_capabilities` (not a hand-maintained second list) and the
-    /// SDK's declared protocol range `{min:1,max:1}`.
+    /// SDK's declared protocol range `{min:1,max:2}`.
     ///
     /// 正对照 (docs/agent/tasks.md T1.1.1 验收命令 #1): if `domain-os.yml`'s
     /// `kernel_capabilities` grows a fourth entry (e.g. `scheduler`), this
@@ -531,7 +531,7 @@ mod tests {
         );
         assert_eq!(
             params["protocol_versions"],
-            json!({"min": 1, "max": 1}),
+            json!({"min": 1, "max": 2}),
             "must declare the SDK's own protocol range: {params}"
         );
     }

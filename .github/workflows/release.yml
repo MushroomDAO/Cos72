@@ -31,7 +31,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -100,7 +100,26 @@ jobs:
       - name: Rustup add target
         run: rustup target add ${{ matrix.target }}
 
+      # S1-9：package.sh 用 Agent24 CLI 生成完整性清单。钉死到带
+      # `package-integrity`（含原生可执行文件检查）的 Agent24 commit，和本包所
+      # 对齐的 Agent24 版本一起升级。
+      - name: Install Agent24 CLI (package-integrity)
+        shell: bash
+        env:
+          AGENT24_REV: b36589eb5b4572def6ddbcd8d35913a2176ac89c
+        run: |
+          set -euo pipefail
+          cargo install --locked --git https://github.com/iDoris-ai/Agent24 \
+            --rev "$AGENT24_REV" --bin agent24 --root "$RUNNER_TEMP/agent24" agent24-cli
+          echo "AGENT24_CLI=$RUNNER_TEMP/agent24/bin/agent24" >> "$GITHUB_ENV"
+
+      # CI 没有 Developer ID 证书，也没有公证凭据：这里打出来的 macOS 包不签名
+      # （与 S1-9 之前一样）。签名的正式包在本机用 scripts/package.sh 构建。
       - name: Package (build + self-check + tar + shasum)
+        shell: bash
+        env:
+          SKIP_SIGN: '1'
+          SKIP_NOTARIZE: '1'
         run: bash scripts/package.sh --target ${{ matrix.target }}
 
       - name: Resolve package name
