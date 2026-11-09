@@ -4,6 +4,10 @@ name: Release
 # 全部沿用 Agent24 DEP-A3 的 release.yml（手写流水线，cargo-dist 已推迟，见 Agent24
 # docs/Deployment/RESEARCH.md §3.1）。只在真正的 `vX.Y.Z` tag 上发布；pull_request
 # 触发时只构建 + 自检，绝不创建 Release。
+#
+# S1-9：CI 没有签名凭据，打出的 macOS 包未签名，Agent24 会拒绝。四个平台仍都
+# 构建并上传为 workflow artifact（含 macOS 自检）；正式 Release 只收文件名含
+# linux 的 tarball。macOS 包（已签名公证）由维护者随后上传，届时更新 SHA256SUMS。
 
 on:
   push:
@@ -158,14 +162,27 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # 下载下来的 artifact 含四个平台。SHA256SUMS 与 Release 只覆盖 Linux
+      # （文件名含 linux）。macOS tarball 留在 dist/，不进校验和、不上传。
       - name: Checksums
         working-directory: dist
+        shell: bash
         run: |
           set -euo pipefail
           ls -la
-          shasum -a 256 -- *.tar.gz > SHA256SUMS
+          shopt -s nullglob
+          archives=( *linux*.tar.gz )
+          if [ "${#archives[@]}" -eq 0 ]; then
+            echo "::error::no linux tarballs to publish"
+            exit 1
+          fi
+          shasum -a 256 -- "${archives[@]}" > SHA256SUMS
           cat SHA256SUMS
           shasum -a 256 -c SHA256SUMS
+          if grep -q macos SHA256SUMS; then
+            echo "::error::SHA256SUMS contains a macOS archive"
+            exit 1
+          fi
 
       # 显式按 event_name 判断，不用 `inputs.dry_run != true` 这类写法——pull_request
       # 触发时 inputs.dry_run 是 null，Actions 的宽松相等比较会把 null 与 false/true
@@ -180,8 +197,13 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
+          NOTES="$(cat <<'EOF'
+          占位：正式发布说明在发布时人工补充。
+          macOS 包（已签名公证）由维护者随后上传，届时更新 SHA256SUMS。
+          EOF
+          )"
           gh release create "$TAG" \
             --verify-tag \
             --title "Cos72 $TAG" \
-            --notes "占位：正式发布说明在发布时人工补充。" \
-            dist/*.tar.gz dist/SHA256SUMS
+            --notes "$NOTES" \
+            dist/*linux*.tar.gz dist/SHA256SUMS
