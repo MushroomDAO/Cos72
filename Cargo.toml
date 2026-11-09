@@ -34,7 +34,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # Cargo.toml (docs/agent/architecture.md 核心判断 1 第三点): builds are
 # reproducible independent of Agent24's own main branch history; bumping
 # this tag is its own, separate commit.
-agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.1.0" }
+agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.2.0" }
 
 [features]
 # T1.1.1 (docs/agent/architecture.md 不可动摇的边界 #9): gates `/debug/*`
@@ -48,7 +48,7 @@ test-hooks = []
 # dev-dependencies only ever need to name the SDK, not `agent24-os-proto`
 # directly (mirrors Sin90's Cargo.toml, same tag so Cargo resolves one copy
 # of `agent24-os-proto` in the dependency graph).
-agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.1.0", features = ["test-util"] }
+agent24-os-sdk = { git = "https://github.com/iDoris-ai/Agent24", tag = "agent24-os-sdk-v0.2.0", features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # Test-only: tests/manifest.rs reads domain-os.yml's own fields (docs/agent/
