@@ -225,8 +225,20 @@ elif [[ ! -x "$agent24_cli" ]]; then
   exit 1
 fi
 echo "==> generating the integrity manifest with $agent24_cli"
-"$agent24_cli" package-integrity generate --root "$STAGE_DIR" --executable bin/cos72
-"$agent24_cli" package-integrity verify --root "$STAGE_DIR"
+# 跨 CPU 打包（例如在 Apple 芯片 Mac 上打 x86_64-apple-darwin 包）时，告诉 CLI
+# 可执行文件的目标架构。同架构打包不传参数，CI 里钉的旧版 Agent24 CLI（没有 --arch）照常可用。
+target_cpu="${TARGET%%-*}"
+case "$(uname -m)" in
+  arm64|aarch64) host_cpu=aarch64 ;;
+  x86_64|amd64)  host_cpu=x86_64 ;;
+  *)             host_cpu="$(uname -m)" ;;
+esac
+arch_args=()
+if [[ "$target_cpu" != "$host_cpu" ]]; then
+  arch_args=(--arch "$target_cpu")
+fi
+"$agent24_cli" package-integrity generate --root "$STAGE_DIR" --executable bin/cos72 ${arch_args[@]+"${arch_args[@]}"}
+"$agent24_cli" package-integrity verify --root "$STAGE_DIR" ${arch_args[@]+"${arch_args[@]}"}
 
 echo "==> tar -czf ${DIST_DIR}/${TARBALL}"
 # COPYFILE_DISABLE：macOS tar 否则会为扩展属性写入 AppleDouble `._*` 条目，
